@@ -416,42 +416,67 @@ fn objects() {
     assert_eq!(o.dkeys().unwrap().count(), 0);
 }
 
+/// Correctness of key enumeration on a populated object. Inserts run on
+/// several threads sharing one `Object`, which also covers concurrent updates
+/// on one handle. `RUST_DAOS_ENUM_KEYS` raises the key count (default 2,000;
+/// the long variant used on the VM is 20,000). Each listing pass is timed.
 fn enumeration() {
+    const THREADS: usize = 8;
     let (_e, pool) = setup();
     let tc = TestCont::create(&pool, "", ContainerCreate::new());
     let c = tc.open();
     let n: usize = std::env::var("RUST_DAOS_ENUM_KEYS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(20_000);
+        .unwrap_or(2_000);
+    // Formatted outside the timed region; zero padded, so already sorted.
+    let want: Vec<Vec<u8>> = (0..n).map(|i| format!("k{i:07}").into_bytes()).collect();
     for class in [ObjectClass::S1, ObjectClass::SX] {
         let o = c
             .object(oid(&c, ObjectType::MultiHashed, class), OpenMode::ReadWrite)
             .unwrap();
         let t0 = Instant::now();
-        for i in 0..n {
-            o.put_single(None, format!("k{i:07}").as_bytes(), b"a", b"v")
-                .unwrap();
-        }
-        println!("{class:?}: {n} puts in {:.1}s", t0.elapsed().as_secs_f64());
+        thread::scope(|s| {
+            for part in want.chunks(n.div_ceil(THREADS).max(1)) {
+                let o = &o;
+                s.spawn(move || {
+                    for k in part {
+                        o.put_single(None, k, b"a", b"v").unwrap();
+                    }
+                });
+            }
+        });
+        println!(
+            "{class:?}: {n} puts on {THREADS} threads in {:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
+        let t0 = Instant::now();
         let mut keys: Vec<Vec<u8>> = o
             .dkeys()
             .unwrap()
             .batch_size(97, 2048)
             .map(Result::unwrap)
             .collect();
+        println!(
+            "{class:?}: listing at 97 keys per call in {:.3}s",
+            t0.elapsed().as_secs_f64()
+        );
         keys.sort();
-        let want: Vec<Vec<u8>> = (0..n).map(|i| format!("k{i:07}").into_bytes()).collect();
         assert!(keys == want, "set of keys for {class:?}");
         // A key longer than the batch buffer.
         let long = vec![b'L'; 10_000];
         o.put_single(None, &long, b"a", b"v").unwrap();
+        let t0 = Instant::now();
         let found = o
             .dkeys()
             .unwrap()
             .batch_size(8, 256)
             .filter(|k| k.as_ref().unwrap().len() == 10_000)
             .count();
+        println!(
+            "{class:?}: listing at 8 keys and 256 bytes per call in {:.3}s",
+            t0.elapsed().as_secs_f64()
+        );
         assert_eq!(found, 1);
         o.put_single(None, b"akeys", b"a1", b"1").unwrap();
         o.put_single(None, b"akeys", b"a2", b"2").unwrap();
@@ -1031,27 +1056,44 @@ fn defaults_record() {
 }
 
 // -- multi-engine cases (run with --ignored) ---------------------------------------
+//
+// Every container here uses redundancy at rank level: on a single host the
+// default level (node) has one fault domain. A case whose class needs more
+// engines than the pool spans is skipped with the reason, not passed.
 
-/// Two replicas (2 engines): update, fetch, punch, enumeration, KV, array.
-/// The container needs `rd_fac` 1 at rank level.
-fn multi_engine_rp2_objects() {
-    replicated(&[ObjectClass::RP_2G1, ObjectClass::RP_2GX]);
+/// Skip the case unless the pool spans at least `n` engines.
+fn require_engines(pool: &Pool, n: u32, what: &str) {
+    let have = pool.query().unwrap().nodes;
+    if have < n {
+        skip(&format!("{what} needs {n} engines, the pool has {have}"));
+    }
 }
 
-/// Three replicas (3 engines).
-fn multi_engine_rp3_objects() {
-    replicated(&[ObjectClass::RP_3G1, ObjectClass::RP_3GX]);
-}
-
-fn replicated(classes: &[ObjectClass]) {
-    let (_e, pool) = setup();
-    let tc = TestCont::create(
-        &pool,
+/// A container with `rd_fac` 1 at rank level.
+fn rank_level_container(pool: &Pool) -> TestCont {
+    TestCont::create(
+        pool,
         "",
         ContainerCreate::new()
             .redundancy_factor(1)
             .redundancy_level(RedundancyLevel::Rank),
-    );
+    )
+}
+
+/// Two replicas (2 engines): update, fetch, punch, enumeration, KV, array.
+fn multi_engine_rp2_objects() {
+    replicated(2, &[ObjectClass::RP_2G1, ObjectClass::RP_2GX]);
+}
+
+/// Three replicas (3 engines).
+fn multi_engine_rp3_objects() {
+    replicated(3, &[ObjectClass::RP_3G1, ObjectClass::RP_3GX]);
+}
+
+fn replicated(width: u32, classes: &[ObjectClass]) {
+    let (_e, pool) = setup();
+    require_engines(&pool, width, &format!("{classes:?}"));
+    let tc = rank_level_container(&pool);
     let c = tc.open();
     for &class in classes {
         let o = c
@@ -1095,59 +1137,102 @@ fn replicated(classes: &[ObjectClass]) {
     }
 }
 
-fn multi_engine_ec_objects() {
-    let (_e, pool) = setup();
-    let tc = TestCont::create(&pool, "", ContainerCreate::new().redundancy_factor(1));
-    let c = tc.open();
-    for class in [ObjectClass::EC_2P1G1, ObjectClass::EC_4P1G1] {
-        let o = c
-            .object(oid(&c, ObjectType::MultiHashed, class), OpenMode::ReadWrite)
-            .unwrap();
-        let v = pattern(1 << 20, 1);
-        o.put_single(None, b"d", b"a", &v).unwrap();
-        assert!(o.get_single_vec(None, b"d", b"a").unwrap().unwrap() == v);
-        assert!(matches!(o.dkeys(), Err(Error::Unsupported { .. })));
-        let kv = c
-            .kv(oid(&c, ObjectType::KvHashed, class), OpenMode::ReadWrite)
-            .unwrap();
-        kv.put(None, "k", b"v").unwrap();
-        assert!(matches!(kv.keys(), Err(Error::Unsupported { .. })));
-        let a = c
-            .array_open_with_attr(
-                oid(&c, ObjectType::ArrayByte, class),
-                OpenMode::ReadWrite,
-                1,
-                1 << 20,
-            )
-            .unwrap();
-        a.write_at(None, 0, &v).unwrap();
-    }
+/// `EC_2P1G1`: 3 engines (2 data, 1 parity).
+fn multi_engine_ec_objects_ec_2p1() {
+    ec_objects(ObjectClass::EC_2P1G1, 3);
 }
 
-fn multi_engine_container_redundancy() {
+/// `EC_4P1G1`: 5 engines (4 data, 1 parity).
+fn multi_engine_ec_objects_ec_4p1() {
+    ec_objects(ObjectClass::EC_4P1G1, 5);
+}
+
+/// Update and fetch on an erasure-code object, KV and array. Key
+/// enumeration of such objects is not offered in this release: both the
+/// object and the KV listing must return `Unsupported`.
+fn ec_objects(class: ObjectClass, width: u32) {
     let (_e, pool) = setup();
-    for (rf, level) in [(1u8, RedundancyLevel::Rank), (2, RedundancyLevel::Node)] {
-        let tc = TestCont::create(
-            &pool,
-            &format!("-rf{rf}"),
-            ContainerCreate::new()
-                .redundancy_factor(rf)
-                .redundancy_level(level),
-        );
-        let c = tc.open();
-        let p = c.properties().unwrap();
-        assert_eq!(p.redundancy_factor, Some(u64::from(rf)));
-        let id = c
-            .generate_oid(
-                1,
-                0,
-                ObjectType::MultiHashed,
-                ObjectClass::UNKNOWN,
-                ClassHints::default(),
-            )
-            .unwrap();
-        println!("rf {rf}: default class {:?}", id.class().name());
+    require_engines(&pool, width, &format!("{class:?}"));
+    let tc = rank_level_container(&pool);
+    let c = tc.open();
+    let o = c
+        .object(oid(&c, ObjectType::MultiHashed, class), OpenMode::ReadWrite)
+        .unwrap();
+    println!("{class:?} -> {:?}", o.id().class());
+    let v = pattern(1 << 20, 1);
+    o.put_single(None, b"d", b"a", &v).unwrap();
+    assert!(o.get_single_vec(None, b"d", b"a").unwrap().unwrap() == v);
+    assert!(matches!(o.dkeys(), Err(Error::Unsupported { .. })));
+    let kv = c
+        .kv(oid(&c, ObjectType::KvHashed, class), OpenMode::ReadWrite)
+        .unwrap();
+    kv.put(None, "k", b"v").unwrap();
+    assert!(kv.get(None, "k").unwrap().unwrap() == b"v");
+    assert!(matches!(kv.keys(), Err(Error::Unsupported { .. })));
+    let a = c
+        .array_open_with_attr(
+            oid(&c, ObjectType::ArrayByte, class),
+            OpenMode::ReadWrite,
+            1,
+            1 << 20,
+        )
+        .unwrap();
+    let v = pattern(3 << 20, 5);
+    a.write_at(None, 0, &v).unwrap();
+    let mut b = vec![0u8; v.len()];
+    a.read_at(None, 0, &mut b).unwrap();
+    assert!(b == v, "{class:?}");
+}
+
+/// `rd_fac` 1 at rank level (2 engines).
+fn multi_engine_container_redundancy_rank() {
+    let (_e, pool) = setup();
+    require_engines(&pool, 2, "rd_fac 1 at rank level");
+    container_redundancy(&pool, 1, RedundancyLevel::Rank);
+}
+
+/// `rd_fac` 2 at node level: 3 engines on 3 different nodes. The engine
+/// count does not show the node count, so the case runs only when
+/// `RUST_DAOS_TEST_NODES` says the system has at least 3 nodes.
+fn multi_engine_container_redundancy_node() {
+    let nodes: u32 = std::env::var("RUST_DAOS_TEST_NODES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    if nodes < 3 {
+        skip(&format!(
+            "rd_fac 2 at node level needs 3 nodes, RUST_DAOS_TEST_NODES is {nodes}"
+        ));
     }
+    let (_e, pool) = setup();
+    require_engines(&pool, 3, "rd_fac 2 at node level");
+    container_redundancy(&pool, 2, RedundancyLevel::Node);
+}
+
+fn container_redundancy(pool: &Pool, rf: u8, level: RedundancyLevel) {
+    let tc = TestCont::create(
+        pool,
+        &format!("-rf{rf}"),
+        ContainerCreate::new()
+            .redundancy_factor(rf)
+            .redundancy_level(level),
+    );
+    let c = tc.open();
+    let p = c.properties().unwrap();
+    assert_eq!(p.redundancy_factor, Some(u64::from(rf)));
+    let id = c
+        .generate_oid(
+            1,
+            0,
+            ObjectType::MultiHashed,
+            ObjectClass::UNKNOWN,
+            ClassHints::default(),
+        )
+        .unwrap();
+    println!(
+        "rf {rf} at {level:?}: default class {:?}",
+        id.class().name()
+    );
 }
 
 fn main() {
@@ -1182,10 +1267,21 @@ fn main() {
         case("defaults_record", defaults_record),
         case("multi_engine_rp2_objects", multi_engine_rp2_objects),
         case("multi_engine_rp3_objects", multi_engine_rp3_objects),
-        case("multi_engine_ec_objects", multi_engine_ec_objects),
         case(
-            "multi_engine_container_redundancy",
-            multi_engine_container_redundancy,
+            "multi_engine_ec_objects_ec_2p1",
+            multi_engine_ec_objects_ec_2p1,
+        ),
+        case(
+            "multi_engine_ec_objects_ec_4p1",
+            multi_engine_ec_objects_ec_4p1,
+        ),
+        case(
+            "multi_engine_container_redundancy_rank",
+            multi_engine_container_redundancy_rank,
+        ),
+        case(
+            "multi_engine_container_redundancy_node",
+            multi_engine_container_redundancy_node,
         ),
     ];
     run_main(&cases, Vec::new);

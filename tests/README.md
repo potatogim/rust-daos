@@ -104,12 +104,24 @@ binary gets `--ignored` (or `--include-ignored`):
 DAOS_POOL=<pool> cargo test --test real_daos_obj -- --ignored
 ```
 
+Containers of these cases use `rd_fac` 1 at rank level (the default level,
+node, has a single fault domain on one host). Each case reads the engine
+count of the pool (`PoolInfo::nodes`) and is skipped, with the reason, when
+the pool spans fewer engines than its class needs. The runner lists skips by
+reason at the end, so a skipped width is not counted as a pass.
+
 | Case | Needs |
 |---|---|
-| `multi_engine_rp2_objects` | 2 engines (`RP_2G1`, `RP_2GX`; container `rd_fac` 1 at rank level) |
+| `multi_engine_rp2_objects` | 2 engines (`RP_2G1`, `RP_2GX`) |
 | `multi_engine_rp3_objects` | 3 engines (`RP_3G1`, `RP_3GX`) |
-| `multi_engine_ec_objects` | 3 engines for `EC_2P1`, 5 for `EC_4P1`; checks that key enumeration returns `Unsupported` |
-| `multi_engine_container_redundancy` | 3 engines on 3 nodes for `rd_fac` 2 at node level |
+| `multi_engine_ec_objects_ec_2p1` | 3 engines (`EC_2P1G1`); key enumeration of the object and of a KV returns `Unsupported` |
+| `multi_engine_ec_objects_ec_4p1` | 5 engines (`EC_4P1G1`); as above |
+| `multi_engine_container_redundancy_rank` | 2 engines, `rd_fac` 1 at rank level |
+| `multi_engine_container_redundancy_node` | `rd_fac` 2 at node level: 3 engines on 3 nodes; runs only with `RUST_DAOS_TEST_NODES=3` (or more) |
+
+The `enumeration` case inserts 2,000 keys per class on 8 threads sharing one
+object and times each listing pass; `RUST_DAOS_ENUM_KEYS=20000` gives the
+long variant.
 
 Kept as a note for the release that adds key enumeration of erasure-code
 objects: an exact-fit `DER_KEY2BIG` on an erasure-code object (the mocks

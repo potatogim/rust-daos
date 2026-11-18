@@ -122,6 +122,7 @@ pub fn run_main(cases: &[Case], prepare: impl FnOnce() -> Vec<(String, String)>)
     println!("\nrunning {} tests (one subprocess each)", selected.len());
     let (mut passed, mut failed, mut skipped) = (0, 0, 0);
     let mut failures = Vec::new();
+    let mut skips: Vec<(String, &str)> = Vec::new();
     let start = Instant::now();
     for c in &selected {
         let mut cmd = Command::new(&exe);
@@ -153,6 +154,7 @@ pub fn run_main(cases: &[Case], prepare: impl FnOnce() -> Vec<(String, String)>)
                     .find(|l| l.starts_with("SKIPPED"))
                     .unwrap_or("SKIPPED");
                 println!("test {} ... skipped: {reason}", c.name);
+                skips.push((reason.to_string(), c.name));
             }
             other => {
                 failed += 1;
@@ -168,6 +170,24 @@ pub fn run_main(cases: &[Case], prepare: impl FnOnce() -> Vec<(String, String)>)
     }
     for (name, out, err) in &failures {
         println!("\n---- {name} stdout ----\n{out}\n---- {name} stderr ----\n{err}");
+    }
+    if !skips.is_empty() {
+        // Skips per reason, so that a skipped width (for example a class that
+        // needs more engines) is not mistaken for a pass.
+        skips.sort();
+        println!("\nskipped, by reason:");
+        let mut i = 0;
+        while i < skips.len() {
+            let reason = &skips[i].0;
+            let names: Vec<&str> = skips
+                .iter()
+                .skip(i)
+                .take_while(|s| &s.0 == reason)
+                .map(|s| s.1)
+                .collect();
+            println!("  {reason}: {}", names.join(", "));
+            i += names.len();
+        }
     }
     let verdict = if failed == 0 { "ok" } else { "FAILED" };
     println!(
