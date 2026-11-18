@@ -399,6 +399,15 @@ objects may still hand out keys they had buffered before the fork (a
 `Error::Forked`. A `MemDfs` created in the child is a backend of its own and
 works there.
 
+`library_info()`, `is_available()` and `init_report()` do not call DAOS. In
+a refused child they answer with the parent's data (`Ok`, `true`, `Some`)
+if the parent's `init` had stored its report before the fork, and with
+`Error::Forked`, `false` and `None` otherwise. When they answer from the
+report, `library_info()` and `is_available()` copy that data: in a child
+made with a raw `clone` of a multithreaded process the copy may wait on an
+allocator lock that another thread of the parent held. `init_report()`
+only borrows the report, and the refusal without a report copies nothing.
+
 How a child is recognised: handles and the process state record the process
 that made them. The crate keeps a token in a private page and asks the
 kernel to clear that page in every child (`MADV_WIPEONFORK`, Linux 4.14 and

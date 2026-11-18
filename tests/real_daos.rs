@@ -451,6 +451,7 @@ fn fork_child_refused() {
     let parent = std::process::id();
     let d = dfs.clone();
     let p2 = p.clone();
+    let lib_path = daos::library_info().unwrap().path;
     let code = fork_and_wait(move || {
         let f = |r: Result<(), Error>| matches!(r, Err(Error::Forked { created_pid, .. }) if created_pid == parent);
         let mut ok = true;
@@ -459,6 +460,10 @@ fn fork_child_refused() {
         ok &= f(d.write(&p2, b"child").map(|_| ()));
         ok &= f(file.read_at(&mut [0u8; 6], 0).map(|_| ()));
         ok &= f(unsafe { daos::init(&InitOptions::default()) }.map(|_| ()));
+        // The observers answer from the parent's stored report.
+        ok &= daos::library_info().is_ok_and(|i| i.path == lib_path);
+        ok &= daos::is_available();
+        ok &= daos::init_report().is_some();
         drop(file);
         drop(d);
         i32::from(!ok)

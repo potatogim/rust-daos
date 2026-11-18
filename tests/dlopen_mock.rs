@@ -443,6 +443,7 @@ fn fork_child_is_refused_and_drop_is_silent() {
     let mut rd = dfs.read_dir("/fk").unwrap();
     let mut w = dfs.writer("/fk/w").unwrap();
     let parent_pid = std::process::id();
+    let lib_path = daos::library_info().unwrap().path;
     let code = fork_and_wait(move || {
         let forked = |r: Result<(), Error>| match r {
             Err(Error::Forked {
@@ -475,6 +476,10 @@ fn fork_child_is_refused_and_drop_is_silent() {
             unsafe { daos::init(&InitOptions::new().library_path(mock_lib(MockVariant::Full))) }
                 .map(|_| ()),
         );
+        // The observers answer from the parent's stored report.
+        ok &= daos::library_info().is_ok_and(|i| i.path == lib_path);
+        ok &= daos::is_available();
+        ok &= daos::init_report().is_some();
         drop(rd);
         drop(w);
         drop(file);
@@ -511,6 +516,7 @@ fn raw_clone_child_is_refused_after_init() {
     dfs.write("/rc/f", b"data").unwrap();
     let file = dfs.open("/rc/f").unwrap();
     let path = mock_lib(MockVariant::Full);
+    let lib_path = daos::library_info().unwrap().path;
     let code = raw_clone_and_wait(|| {
         let forked = |r: Result<(), Error>| matches!(r, Err(Error::Forked { .. }));
         let mut ok = true;
@@ -519,6 +525,9 @@ fn raw_clone_child_is_refused_after_init() {
         ok &= forked(unsafe { daos::init(&InitOptions::new().library_path(&path)) }.map(|_| ()));
         ok &= forked(Dfs::connect("pool", "cont").map(|_| ()));
         ok &= forked(file.size().map(|_| ()));
+        ok &= daos::library_info().is_ok_and(|i| i.path == lib_path);
+        ok &= daos::is_available();
+        ok &= daos::init_report().is_some();
         i32::from(!ok)
     });
     assert_eq!(code, 0, "child checks failed");

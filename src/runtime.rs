@@ -301,7 +301,15 @@ fn init_with(
     }
 }
 
-/// Report of the completed [`init`], if any.
+/// Report of [`init`], once it was stored.
+///
+/// In a refused fork child (see [`Error::Forked`]) it returns the parent's
+/// report when the parent's [`init`] had stored it before the fork, although
+/// DAOS operations there return [`Error::Forked`]; otherwise `None` in such a
+/// child. It only borrows the stored report, also in a child made with a
+/// raw `clone`. A child that is not refused, for example one forked before
+/// the parent called [`init`], can call [`init`] itself and then gets its
+/// own report.
 pub fn init_report() -> Option<&'static InitReport> {
     RUNTIME.get().map(|rt| &rt.report)
 }
@@ -313,14 +321,23 @@ pub fn init_report() -> Option<&'static InitReport> {
 /// information is returned. Otherwise `RUST_DAOS_LIBDFS`, then `"libdfs.so"`
 /// is loaded.
 ///
+/// In a refused fork child it answers `Ok` from the parent's stored report
+/// when there is one (the report is stored just before [`init`] returns
+/// `Ok`), and [`Error::Forked`] otherwise. The answer from the report is a
+/// copy: in a child made with a raw `clone` of a multithreaded process,
+/// which runs none of the C library's fork handlers, the copy may wait on
+/// an allocator lock that another thread of the parent held. The refusal
+/// without a report copies nothing. In a process that is not refused and
+/// has no stored report it loads the library as described above.
+///
 /// # Errors
 ///
-/// The load errors of [`init`], and [`Error::Forked`] in a fork child of a
-/// process in which another thread was inside [`init`] or the library load
-/// at the moment of the fork (the child does not wait for their locks).
-/// A fork child of a process whose [`init`] failed for good (`dfs_init`
-/// failed) also gets [`Error::Forked`], from this function and from [`init`],
-/// instead of the error stored in the parent.
+/// The load errors of [`init`], and [`Error::Forked`] in a refused fork child
+/// without a stored report: a child of a process in which another thread was
+/// inside [`init`] or the library load at the moment of the fork (the child
+/// does not wait for their locks), or of a process whose [`init`] failed for
+/// good (`dfs_init` failed; the child gets [`Error::Forked`], from this
+/// function and from [`init`], instead of the error stored in the parent).
 pub fn library_info() -> Result<LibraryInfo> {
     if let Some(rt) = RUNTIME.get() {
         return Ok(rt.report.library.clone());
@@ -331,7 +348,11 @@ pub fn library_info() -> Result<LibraryInfo> {
 }
 
 /// True when libdfs can be loaded. Never panics, never initialises DAOS.
-/// False where [`library_info`] returns an error, also [`Error::Forked`].
+/// In a refused fork child true when [`library_info`] answers from the
+/// parent's stored report; in a child made with a raw `clone` of a
+/// multithreaded process it may then wait while copying, as
+/// [`library_info`] does. False where [`library_info`] returns an error, also
+/// [`Error::Forked`].
 pub fn is_available() -> bool {
     matches!(std::panic::catch_unwind(library_info), Ok(Ok(_)))
 }

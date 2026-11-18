@@ -89,15 +89,19 @@
 //!
 //! # Processes
 //!
-//! libdaos and DFS mount state do not survive `fork`. Every use of the crate
-//! in a fork child of a process that called [`init`] returns
-//! [`Error::Forked`], and dropping inherited handles in the child does
-//! nothing. The same holds when another thread of the parent was inside
-//! [`init`] or inside the library load of [`library_info`] at the moment of
-//! the fork: the child gets [`Error::Forked`] at once instead of waiting for
-//! a lock that thread held. Start workers with spawn (or fork then exec) and
-//! call [`init`] and connect in each process. Forking before [`init`] is
-//! fine, also after a [`library_info`] probe in the parent.
+//! libdaos and DFS mount state do not survive `fork`. A fork child is
+//! refused when the parent had stored the result of [`init`], or when a
+//! thread of the parent was inside [`init`] or inside the library load of
+//! [`library_info`] at the moment of the fork. In a refused child [`init`],
+//! connects and operations that call DAOS on inherited handles return
+//! [`Error::Forked`] before they take a lock of the crate, so the child does
+//! not wait for a lock a parent thread held, and dropping inherited handles
+//! calls nothing in DAOS. [`library_info`], [`is_available`] and
+//! [`init_report`] answer in a refused child from the parent's report when
+//! the parent had stored it. The README section Processes lists what is not
+//! covered and how a child is recognised. Start workers with spawn (or fork
+//! then exec) and call [`init`] and connect in each process. Forking before
+//! [`init`] is fine, also after a [`library_info`] probe in the parent.
 //!
 //! # One system per process
 //!
