@@ -1,0 +1,65 @@
+name: DAOS headers
+
+# Weekly: compare the crate's declarations with the headers of the newest
+# DAOS 2.6.x and 2.8.x release tags. Needs only header files and a C
+# compiler, no DAOS build.
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  headers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install uuid headers
+        run: sudo apt-get update && sudo apt-get install -y uuid-dev
+      - name: fetch DAOS tags
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/daos-stack/daos.git daos-src
+          newest() { git -C daos-src tag -l "$1" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1; }
+          echo "TAG26=$(newest 'v2.6.*')" >>"$GITHUB_ENV"
+          echo "TAG28=$(newest 'v2.8.*')" >>"$GITHUB_ENV"
+      - name: prototype snapshot
+        id: protos
+        continue-on-error: true
+        run: tools/check-headers.sh daos-src "$TAG26" "$TAG28" | tee protos.txt
+      - name: ABI probe
+        id: probe
+        continue-on-error: true
+        run: |
+          tools/abi-probe/run.sh daos-src "$TAG26" "$TAG28"
+          # Layout lines must equal the crate's; the unit test compares the
+          # checked-in files, so regenerate them under the stable names too.
+          if [ "$TAG26" != v2.6.4 ]; then cp "abi/layout-$TAG26.txt" abi/layout-v2.6.4.txt; fi
+          if [ "$TAG28" != v2.8.1 ]; then cp "abi/layout-$TAG28.txt" abi/layout-v2.8.1.txt; fi
+          cargo test --lib abi_layout_matches_probe_files
+      - name: open an issue on a difference
+        if: steps.protos.outcome == 'failure' || steps.probe.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Header check against $TAG26 and $TAG28 found a difference."
+            echo
+            echo '```'
+            cat protos.txt 2>/dev/null || true
+            echo '```'
+            echo
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } >body.md
+          title="DAOS header difference ($TAG26 / $TAG28)"
+          open=$(gh issue list --state open --search "\"$title\" in:title" --json title \
+            --jq "map(select(.title == \"$title\")) | length")
+          if [ "$open" != "0" ]; then
+            echo "an open issue with this title exists; not opening another"
+            exit 0
+          fi
+          gh issue create --title "$title" --body-file body.md

@@ -1,0 +1,315 @@
+sizeof d_iov_t 24
+offsetof d_iov_t iov_buf 0
+offsetof d_iov_t iov_buf_len 8
+offsetof d_iov_t iov_len 16
+sizeof d_sg_list_t 16
+offsetof d_sg_list_t sg_nr 0
+offsetof d_sg_list_t sg_nr_out 4
+offsetof d_sg_list_t sg_iovs 8
+sizeof daos_anchor_t 120
+offsetof daos_anchor_t da_type 0
+offsetof daos_anchor_t da_shard 2
+offsetof daos_anchor_t da_flags 4
+offsetof daos_anchor_t da_sub_anchors 8
+offsetof daos_anchor_t da_buf 16
+sizeof daos_obj_id_t 16
+offsetof daos_obj_id_t lo 0
+offsetof daos_obj_id_t hi 8
+width daos_size_t 64 0
+width daos_off_t 64 0
+width daos_oclass_id_t 32 0
+width mode_t 32 0
+const DAOS_ANCHOR_TYPE_EOF 3
+const DAOS_ANCHOR_BUF_MAX 104
+const DFS_MAX_NAME 255
+const DFS_MAX_PATH 4096
+const OC_UNKNOWN 0
+sizeof daos_handle_t 8
+offsetof daos_handle_t cookie 0
+sizeof daos_epoch_range_t 16
+offsetof daos_epoch_range_t epr_lo 0
+offsetof daos_epoch_range_t epr_hi 8
+sizeof daos_space 32
+offsetof daos_space s_total 0
+offsetof daos_space s_free 16
+sizeof daos_pool_space 88
+offsetof daos_pool_space ps_space 0
+offsetof daos_pool_space ps_free_min 32
+offsetof daos_pool_space ps_free_max 48
+offsetof daos_pool_space ps_free_mean 64
+offsetof daos_pool_space ps_ntargets 80
+sizeof daos_rebuild_status 56
+offsetof daos_rebuild_status rs_version 0
+offsetof daos_rebuild_status rs_seconds 4
+offsetof daos_rebuild_status rs_errno 8
+offsetof daos_rebuild_status rs_state 12
+offsetof daos_rebuild_status rs_fail_rank 20
+offsetof daos_rebuild_status rs_toberb_obj_nr 24
+offsetof daos_rebuild_status rs_obj_nr 32
+offsetof daos_rebuild_status rs_rec_nr 40
+offsetof daos_rebuild_status rs_size 48
+sizeof daos_pool_info_t 192
+offsetof daos_pool_info_t pi_uuid 0
+offsetof daos_pool_info_t pi_ntargets 16
+offsetof daos_pool_info_t pi_nnodes 20
+offsetof daos_pool_info_t pi_ndisabled 24
+offsetof daos_pool_info_t pi_map_ver 28
+offsetof daos_pool_info_t pi_leader 32
+offsetof daos_pool_info_t pi_bits 40
+offsetof daos_pool_info_t pi_space 48
+offsetof daos_pool_info_t pi_rebuild_st 136
+sizeof daos_target_info_t 48
+offsetof daos_target_info_t ta_state 4
+offsetof daos_target_info_t ta_perf 8
+offsetof daos_target_info_t ta_space 16
+sizeof daos_pool_cont_info 144
+offsetof daos_pool_cont_info pci_uuid 0
+offsetof daos_pool_cont_info pci_label 16
+sizeof daos_cont_info_t 48
+offsetof daos_cont_info_t ci_uuid 0
+offsetof daos_cont_info_t ci_lsnapshot 16
+offsetof daos_cont_info_t ci_nhandles 24
+offsetof daos_cont_info_t ci_nsnapshots 28
+offsetof daos_cont_info_t ci_md_otime 32
+offsetof daos_cont_info_t ci_md_mtime 40
+sizeof daos_prop_entry 16
+offsetof daos_prop_entry dpe_type 0
+offsetof daos_prop_entry dpe_flags 4
+offsetof daos_prop_entry dpe_reserv 6
+offsetof daos_prop_entry dpe_val 8
+sizeof daos_prop_t 16
+offsetof daos_prop_t dpp_nr 0
+offsetof daos_prop_t dpp_reserv 4
+offsetof daos_prop_t dpp_entries 8
+sizeof dfs_attr_t 176
+offsetof dfs_attr_t da_id 0
+offsetof dfs_attr_t da_chunk_size 8
+offsetof dfs_attr_t da_oclass_id 16
+offsetof dfs_attr_t da_props 24
+offsetof dfs_attr_t da_mode 32
+offsetof dfs_attr_t da_dir_oclass_id 36
+offsetof dfs_attr_t da_file_oclass_id 40
+offsetof dfs_attr_t da_hints 44
+sizeof daos_recx_t 16
+offsetof daos_recx_t rx_idx 0
+offsetof daos_recx_t rx_nr 8
+sizeof daos_iod_t 64
+offsetof daos_iod_t iod_name 0
+offsetof daos_iod_t iod_type 24
+offsetof daos_iod_t iod_size 32
+offsetof daos_iod_t iod_flags 40
+offsetof daos_iod_t iod_nr 48
+offsetof daos_iod_t iod_recxs 56
+sizeof daos_key_desc_t 16
+offsetof daos_key_desc_t kd_key_len 0
+offsetof daos_key_desc_t kd_val_type 8
+sizeof daos_range_t 16
+offsetof daos_range_t rg_idx 0
+offsetof daos_range_t rg_len 8
+sizeof daos_array_iod_t 32
+offsetof daos_array_iod_t arr_nr 0
+offsetof daos_array_iod_t arr_rgs 8
+offsetof daos_array_iod_t arr_nr_short_read 16
+offsetof daos_array_iod_t arr_nr_read 24
+sizeof daos_array_stbuf_t 16
+offsetof daos_array_stbuf_t st_size 0
+offsetof daos_array_stbuf_t st_max_epoch 8
+width daos_epoch_t 64 0
+width d_rank_t 32 0
+width daos_iod_type_t 32 0
+width daos_oclass_hints_t 16 0
+width daos_otype_t 32 0
+const DAOS_PC_RO 1
+const DAOS_PC_RW 2
+const DAOS_COO_RO 1
+const DAOS_COO_RW 2
+const DAOS_COO_FORCE 8
+const DPI_SPACE 1
+const DPI_REBUILD_STATUS 2
+const DAOS_PROP_LABEL_MAX_LEN 127
+const DAOS_PROP_ENTRIES_MAX_NR 128
+const DAOS_CONT_HINT_MAX_LEN 128
+const DAOS_PROP_CO_LABEL 4097
+const DAOS_PROP_CO_LAYOUT_TYPE 4098
+const DAOS_PROP_CO_LAYOUT_VER 4099
+const DAOS_PROP_CO_CSUM 4100
+const DAOS_PROP_CO_REDUN_FAC 4103
+const DAOS_PROP_CO_REDUN_LVL 4104
+const DAOS_PROP_CO_SNAPSHOT_MAX 4105
+const DAOS_PROP_CO_OWNER 4109
+const DAOS_PROP_CO_OWNER_GROUP 4110
+const DAOS_PROP_CO_STATUS 4114
+const DAOS_PROP_CO_ALLOCED_OID 4115
+const DAOS_PROP_CO_EC_CELL_SZ 4116
+const DAOS_PROP_ENTRY_NOT_SET 1
+const DAOS_PROP_CO_LAYOUT_UNKNOWN 0
+const DAOS_PROP_CO_LAYOUT_POSIX 1
+const DAOS_PROP_CO_LAYOUT_HDF5 2
+const DAOS_PROP_CO_LAYOUT_PYTHON 3
+const DAOS_PROP_CO_REDUN_RANK 1
+const DAOS_PROP_CO_REDUN_NODE 2
+const DAOS_IOD_SINGLE 1
+const DAOS_IOD_ARRAY 2
+const DAOS_REC_ANY 0
+const DAOS_OO_RO 2
+const DAOS_OO_RW 4
+const DAOS_OO_EXCL 8
+const DAOS_COND_PUNCH 1
+const DAOS_COND_DKEY_INSERT 2
+const DAOS_COND_DKEY_UPDATE 4
+const DAOS_COND_DKEY_FETCH 8
+const DAOS_COND_AKEY_INSERT 16
+const DAOS_COND_AKEY_UPDATE 32
+const DAOS_COND_AKEY_FETCH 64
+const DAOS_COND_KEY_INSERT 2
+const DAOS_GET_MAX 1
+const DAOS_GET_MIN 2
+const DAOS_GET_DKEY 4
+const DAOS_GET_AKEY 8
+const DAOS_GET_RECX 16
+const MAX_OBJ_CLASS_NAME_LEN 24
+const OR_RS_2P1 32
+const MAX_NUM_GROUPS 65535
+const DAOS_TF_RDONLY 1
+const DAOS_TF_ZERO_COPY 2
+const DAOS_OT_MULTI_HASHED 0
+const DAOS_OT_DKEY_UINT64 2
+const DAOS_OT_AKEY_UINT64 3
+const DAOS_OT_MULTI_UINT64 4
+const DAOS_OT_DKEY_LEXICAL 5
+const DAOS_OT_AKEY_LEXICAL 6
+const DAOS_OT_MULTI_LEXICAL 7
+const DAOS_OT_KV_HASHED 8
+const DAOS_OT_KV_UINT64 9
+const DAOS_OT_KV_LEXICAL 10
+const DAOS_OT_ARRAY 11
+const DAOS_OT_ARRAY_ATTR 12
+const DAOS_OT_ARRAY_BYTE 13
+const OC_S1 16777217
+const OC_SX 16842751
+const OC_RP_2G1 134217729
+const OC_RP_2GX 134283263
+const OC_RP_3G1 150994945
+const OC_RP_3GX 151060479
+const OC_EC_2P1G1 536870913
+const OC_EC_2P1GX 536936447
+const OC_EC_4P1G1 570425345
+const OC_EC_4P1GX 570490879
+const OC_EC_4P2G1 587202561
+const OC_EC_4P2GX 587268095
+const OC_EC_8P2G1 620756993
+const OC_EC_8P2GX 620822527
+const OC_EC_16P2G1 654311425
+const OC_EC_16P2GX 654376959
+const DAOS_OCH_RDD_DEF 1
+const DAOS_OCH_RDD_NO 2
+const DAOS_OCH_RDD_RP 4
+const DAOS_OCH_RDD_EC 8
+const DAOS_OCH_SHD_DEF 16
+const DAOS_OCH_SHD_TINY 32
+const DAOS_OCH_SHD_REG 64
+const DAOS_OCH_SHD_HI 128
+const DAOS_OCH_SHD_EXT 256
+const DAOS_OCH_SHD_MAX 512
+oid 576742231880521336 8 16777217 1
+oid 946600344979037936 13 570490879 65535
+oid 290763719661584384 4 150994960 16
+der DER_NO_PERM 1001
+der DER_NO_HDL 1002
+der DER_INVAL 1003
+der DER_EXIST 1004
+der DER_NONEXIST 1005
+der DER_UNREACH 1006
+der DER_NOSPACE 1007
+der DER_ALREADY 1008
+der DER_NOMEM 1009
+der DER_NOSYS 1010
+der DER_TIMEDOUT 1011
+der DER_BUSY 1012
+der DER_AGAIN 1013
+der DER_PROTO 1014
+der DER_UNINIT 1015
+der DER_TRUNC 1016
+der DER_OVERFLOW 1017
+der DER_CANCELED 1018
+der DER_OOG 1019
+der DER_HG 1020
+der DER_UNREG 1021
+der DER_ADDRSTR_GEN 1022
+der DER_PMIX 1023
+der DER_IVCB_FORWARD 1024
+der DER_MISC 1025
+der DER_BADPATH 1026
+der DER_NOTDIR 1027
+der DER_CORPC_INCOMPLETE 1028
+der DER_NO_RAS_RANK 1029
+der DER_NOTATTACH 1030
+der DER_MISMATCH 1031
+der DER_EXCLUDED 1032
+der DER_NOREPLY 1033
+der DER_DOS 1034
+der DER_BAD_TARGET 1035
+der DER_GRPVER 1036
+der DER_HLC_SYNC 1037
+der DER_NO_SHMEM 1038
+der DER_ADD_METRIC_FAILED 1039
+der DER_DURATION_MISMATCH 1040
+der DER_OP_NOT_PERMITTED 1041
+der DER_EXCEEDS_PATH_LEN 1042
+der DER_METRIC_NOT_FOUND 1043
+der DER_SHMEM_PERMS 1044
+der DER_HG_FATAL 1045
+der DER_QUOTA_LIMIT 1046
+der DER_IO 2001
+der DER_FREE_MEM 2002
+der DER_ENOENT 2003
+der DER_NOTYPE 2004
+der DER_NOSCHEMA 2005
+der DER_NOLOCAL 2006
+der DER_STALE 2007
+der DER_NOTLEADER 2008
+der DER_TGT_CREATE 2009
+der DER_EP_RO 2010
+der DER_EP_OLD 2011
+der DER_KEY2BIG 2012
+der DER_REC2BIG 2013
+der DER_IO_INVAL 2014
+der DER_EQ_BUSY 2015
+der DER_DOMAIN 2016
+der DER_SHUTDOWN 2017
+der DER_INPROGRESS 2018
+der DER_NOTAPPLICABLE 2019
+der DER_NOTREPLICA 2020
+der DER_CSUM 2021
+der DER_DF_INVAL 2022
+der DER_DF_INCOMPT 2023
+der DER_REC_SIZE 2024
+der DER_TX_RESTART 2025
+der DER_DATA_LOSS 2026
+der DER_OP_CANCELED 2027
+der DER_TX_BUSY 2028
+der DER_AGENT_INCOMPAT 2029
+der DER_NEED_TX 2030
+der DER_RF 2031
+der DER_FETCH_AGAIN 2032
+der DER_TX_UNCERTAIN 2033
+der DER_AGENT_COMM 2034
+der DER_ID_MISMATCH 2035
+der DER_TGT_RETRY 2036
+der DER_NOTSUPPORTED 2037
+der DER_CONTROL_INCOMPAT 2038
+der DER_NO_SERVICE 2039
+der DER_TX_ID_REUSED 2040
+der DER_UPDATE_AGAIN 2041
+der DER_NVME_IO 2042
+der DER_NO_CERT 2043
+der DER_BAD_CERT 2044
+der DER_VOS_PARTIAL_UPDATE 2045
+der DER_CHKPT_BUSY 2046
+der DER_DIV_BY_ZERO 2047
+der DER_OVERLOAD_RETRY 2048
+der DER_NOT_RESUME 2049
+der DER_CONT_NONEXIST 2050
+der DER_CONT_DESTROYING 2051
+der DER_IGNORE 2052
+der DER_REBUILD_DELAY 2053

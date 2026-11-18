@@ -1,0 +1,4 @@
+# Toolchain for contributors. CI overrides it for the MSRV job.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

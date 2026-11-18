@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  # Branches only: a tag push runs release.yml, which calls this workflow.
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # Fail instead of skip when the C mock cannot be built.
+      RUST_DAOS_REQUIRE_MOCK: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Unit tests (with the ABI comparison), mem_backend, process and
+      # dlopen_mock; real_daos prints "skipped" (no DAOS here).
+      - run: cargo test --all-features
+
+  test-no-features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --no-default-features
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.77.0"
+      # rust-toolchain.toml selects stable; `+1.77.0` overrides it, so this
+      # really builds with the MSRV toolchain.
+      - run: cargo +1.77.0 check --all-features --all-targets
+
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo doc --no-deps --all-features
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans advisories sources
+
+  absent-library:
+    # No DAOS installed: the example must fail cleanly with the "not found" text.
+    runs-on: ubuntu-latest
+    container: rust:1-slim
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --example ls
+      - name: run without libdfs
+        run: |
+          set +e
+          ./target/debug/examples/ls pool cont / 2>err.txt
+          code=$?
+          set -e
+          cat err.txt
+          test "$code" -eq 1
+          grep -q "DAOS client library not found: tried \"libdfs.so\"" err.txt
+
+  dco:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: every commit carries Signed-off-by
+        run: |
+          base=${{ github.event.pull_request.base.sha }}
+          head=${{ github.event.pull_request.head.sha }}
+          missing=0
+          for c in $(git rev-list "$base..$head"); do
+            if ! git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$c" | grep -q .; then
+              echo "commit $c has no Signed-off-by trailer"
+              missing=1
+            fi
+          done
+          exit $missing
+
+  cross-check:
+    # The crate must compile where DAOS does not exist (platform gate).
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [aarch64-unknown-linux-gnu, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo check --all-features --target ${{ matrix.target }}

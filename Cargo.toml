@@ -1,0 +1,61 @@
+[package]
+name = "daos"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+description = "Client for DAOS: DFS, objects, key-value and arrays, loading libdfs at run time"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/potatogim/rust-daos"
+documentation = "https://docs.rs/daos"
+readme = "README.md"
+keywords = ["daos", "dfs", "storage", "hpc", "object-store"]
+categories = ["api-bindings", "filesystem"]
+authors = ["Jihyeon Gim"]
+include = [
+    "/src/**/*.rs",
+    "/abi/*.txt",
+    "/Cargo.toml",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+    "/LICENSE-THIRD-PARTY",
+]
+
+[features]
+default = []
+# In-memory stand-in backend (daos::mock::MemDfs, alias MemDaos) for tests
+# without DAOS.
+mock = []
+
+[dependencies]
+libc = "0.2"
+libloading = "0.8"
+
+[[test]]
+name = "mem_backend"
+required-features = ["mock"]
+
+[[test]]
+name = "mem_daos"
+required-features = ["mock"]
+
+[[test]]
+name = "process"
+harness = false
+required-features = ["mock"]
+
+[[test]]
+name = "dlopen_mock"
+harness = false
+
+[[test]]
+name = "real_daos"
+harness = false
+
+[[test]]
+name = "real_daos_obj"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true
