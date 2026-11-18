@@ -6,6 +6,7 @@ on:
     branches: ["**"]
   pull_request:
   workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -129,3 +130,103 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - run: cargo check --all-features --target ${{ matrix.target }}
+
+  real-daos:
+    # real_daos and real_daos_obj against a single-engine DAOS system in a
+    # container (ci/daos). daos-image.yml pushes the image from main; here it
+    # is only pulled, by a tag that hashes ci/daos/Dockerfile, or built
+    # locally. The container runs --privileged with the host network and
+    # changes host hugepage settings: this job must never run on a
+    # self-hosted runner, only on GitHub's throwaway VMs.
+    name: real DAOS ${{ matrix.daos }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      # pull the test image from ghcr.io
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        daos: ["2.6.4", "2.8.1"]
+    env:
+      DAOS_VERSION: ${{ matrix.daos }}
+      IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/rust-daos-ci
+      DAOS_CT_HOST_PREP: "1"
+      # A release (tag) never uses a pushed image or a build cache.
+      FRESH_BUILD: ${{ startsWith(github.ref, 'refs/tags/') }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: image name
+        id: image
+        # Image names must be lowercase; the owner name need not be.
+        run: echo "ref=${IMAGE_REPO,,}:$(ci/daos/image-tag.sh "$DAOS_VERSION")" >>"$GITHUB_OUTPUT"
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        if: env.FRESH_BUILD != 'true'
+        continue-on-error: true
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: pull the image built on main
+        id: pull
+        if: env.FRESH_BUILD != 'true'
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: |
+          if docker pull "$IMAGE"; then
+            echo "hit=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "hit=false" >>"$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        if: steps.pull.outputs.hit != 'true'
+      - name: build the image (cached)
+        if: steps.pull.outputs.hit != 'true' && env.FRESH_BUILD != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: ci/daos
+          build-args: DAOS_VERSION=${{ matrix.daos }}
+          tags: ${{ steps.image.outputs.ref }}
+          load: true
+          push: false
+          cache-from: type=gha,scope=daos-${{ matrix.daos }}
+          # A cache write failure (rate limit, quota) must not fail the job.
+          cache-to: type=gha,mode=max,scope=daos-${{ matrix.daos }},ignore-error=true
+      - name: build the image (from scratch)
+        if: env.FRESH_BUILD == 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: ci/daos
+          build-args: DAOS_VERSION=${{ matrix.daos }}
+          tags: ${{ steps.image.outputs.ref }}
+          load: true
+          push: false
+          pull: true
+          no-cache: true
+      - name: start DAOS
+        timeout-minutes: 10
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: ci/daos/up.sh "$IMAGE"
+      - name: build the tests
+        timeout-minutes: 10
+        run: docker exec rust-daos-ci /src/ci/daos/test.sh build
+      - name: real_daos
+        timeout-minutes: 15
+        run: docker exec rust-daos-ci /src/ci/daos/test.sh real_daos
+      - name: real_daos_obj
+        timeout-minutes: 15
+        run: docker exec rust-daos-ci /src/ci/daos/test.sh real_daos_obj
+      - name: stop DAOS
+        if: always()
+        timeout-minutes: 5
+        run: ci/daos/down.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: failure() || cancelled()
+        with:
+          name: daos-logs-${{ matrix.daos }}
+          path: ${{ runner.temp }}/daos-ct/logs
+          if-no-files-found: warn

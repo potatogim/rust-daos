@@ -51,6 +51,10 @@ CRT_MRC_ENABLE=0 DAOS_POOL=<pool> RUST_DAOS_REQUIRE_REAL=1 \
     cargo test --test real_daos_obj
 ```
 
+CI runs both suites against DAOS 2.6.4 and 2.8.1 in a container (job
+`real-daos`); [tests/README.md](tests/README.md#real-daos-tests-on-ci) says
+how it works and how to start the same container locally.
+
 The C mock (`tests/mock`) needs a C compiler (`cc`, or `CC`).
 
 ## Changes to the FFI declarations

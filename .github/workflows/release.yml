@@ -10,6 +10,11 @@ permissions:
 jobs:
   ci:
     uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      # the real-daos job may pull its test image from ghcr.io (it rebuilds
+      # from scratch on a tag, but the job asks for the permission)
+      packages: read
 
   publish:
     needs: ci
