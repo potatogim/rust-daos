@@ -77,6 +77,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo doc --no-deps --all-features
+      # Without features the mock module is absent; its links must still
+      # resolve.
+      - run: cargo doc --no-deps
 
   deny:
     runs-on: ubuntu-latest

@@ -122,7 +122,14 @@
 //!
 //! # Testing without DAOS
 //!
-//! Feature `mock` adds [`mock::MemDfs`] (also named `MemDaos`), an in-memory
+#![cfg_attr(
+    feature = "mock",
+    doc = "Feature `mock` adds [`mock::MemDfs`] (also named `MemDaos`), an in-memory"
+)]
+#![cfg_attr(
+    not(feature = "mock"),
+    doc = "Feature `mock` adds `mock::MemDfs` (also named `MemDaos`), an in-memory"
+)]
 //! backend, with `Dfs::connect_mock`, `Pool::connect_mock` and
 //! `Container::open_mock`.
 
