@@ -224,6 +224,10 @@ pub fn fork_and_wait(child: impl FnOnce() -> i32) -> i32 {
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork failed");
     if pid == 0 {
+        // A child that hangs (the failure the fork cases look for) would keep
+        // the runner's output pipes open for ever; SIGALRM ends it instead.
+        // SAFETY: alarm has no preconditions.
+        unsafe { libc::alarm(20) };
         let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(child)).unwrap_or(99);
         // SAFETY: terminate the child without running atexit handlers or
         // destructors inherited from the parent.
@@ -364,7 +368,8 @@ pub struct MockCtl {
 
 impl MockCtl {
     pub fn open(v: MockVariant) -> MockCtl {
-        // SAFETY: the mock library has no constructors.
+        // SAFETY: the mock's only constructor is the load pause, which does
+        // nothing unless RUST_DAOS_MOCK_LOAD_PAUSE is set.
         let lib = unsafe { libloading::Library::new(mock_lib(v)) }.expect("open mock");
         MockCtl { lib }
     }

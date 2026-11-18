@@ -189,6 +189,27 @@ fn fork_child_does_not_hang_on_registry_or_allocator_locks() {
     next(&ids).unwrap();
 }
 
+/// A child of a process that used only the in-memory backend owns the
+/// process state: `library_info` reaches the loader (here an absent library)
+/// instead of returning `Forked`.
+fn fork_after_mock_use_reaches_the_loader() {
+    let mem = Arc::new(MemDfs::new());
+    let dfs = Dfs::connect_mock(mem).unwrap();
+    dfs.write("/x", b"1").unwrap();
+    std::env::set_var(daos::LIBDFS_ENV, "/nonexistent/dir/libdfs.so");
+    let code = fork_and_wait(|| {
+        i32::from(!matches!(
+            daos::library_info(),
+            Err(Error::LibraryNotFound { .. })
+        ))
+    });
+    assert_eq!(code, 0);
+    assert!(matches!(
+        daos::library_info(),
+        Err(Error::LibraryNotFound { .. })
+    ));
+}
+
 fn main() {
     let cases = [
         case(
@@ -205,6 +226,10 @@ fn main() {
             fork_child_with_parent_thread_inside_a_call,
         ),
         case("fork_before_connect_is_fine", fork_before_connect_is_fine),
+        case(
+            "fork_after_mock_use_reaches_the_loader",
+            fork_after_mock_use_reaches_the_loader,
+        ),
     ];
     run_main(&cases, Vec::new);
 }

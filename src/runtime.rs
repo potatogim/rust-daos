@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::error::{Error, Result};
-use crate::fork::Stamp;
+use crate::fork::{Stamp, OWNER};
 use crate::sys::api::Raw;
 
 /// Environment variable naming libdfs (absolute path or soname).
@@ -171,12 +171,20 @@ pub(crate) struct Runtime {
     requested_path: Option<PathBuf>,
 }
 
+// Results are published in cells that are read without a lock, so that no
+// reader waits for an init running in another thread (or, after a fork, in a
+// thread that no longer exists).
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-/// Serialises init; holds the fatal error of a failed dfs_init.
-static INIT_STATE: Mutex<Option<Error>> = Mutex::new(None);
+/// The error of a failed `dfs_init`: DAOS is unusable in this process.
+static FATAL: OnceLock<Error> = OnceLock::new();
+/// Serialises init. Taken only after [`OWNER`] was claimed and while
+/// `OWNER.enter_init()` counts the caller.
+static INIT_LOCK: Mutex<()> = Mutex::new(());
 
-/// The runtime, if [`init`] completed. Checks the fork stamp first.
+/// The runtime, if [`init`] completed. Checks process ownership and the fork
+/// stamp first.
 pub(crate) fn runtime() -> Result<&'static Runtime> {
+    OWNER.claim()?;
     match RUNTIME.get() {
         Some(rt) => {
             rt.stamp.check_cold()?;
@@ -206,7 +214,11 @@ pub(crate) fn runtime() -> Result<&'static Runtime> {
 ///   process and every later call returns the same error.
 /// - [`Error::AlreadyInitialized`] when called again with a different
 ///   [`InitOptions::library_path`].
-/// - [`Error::Forked`] in a fork child of a process that had initialised DAOS.
+/// - [`Error::Forked`] in a fork child of a process that had initialised DAOS
+///   or whose `init` failed for good (the child gets `Forked`, not the stored
+///   `dfs_init` error), or in which another thread was inside `init` or the
+///   library load at the moment of the fork. The child does not wait for locks that a parent
+///   thread held.
 ///
 /// # Example
 ///
@@ -221,6 +233,9 @@ pub(crate) fn runtime() -> Result<&'static Runtime> {
 /// }
 /// ```
 pub unsafe fn init(options: &InitOptions) -> Result<&'static InitReport> {
+    // Before any lock: a fork child must not wait for the init lock or the
+    // loader lock that a parent thread held at the fork.
+    OWNER.claim()?;
     if let Some(rt) = RUNTIME.get() {
         rt.stamp.check_cold()?;
         if rt.requested_path != options.library_path {
@@ -228,14 +243,20 @@ pub unsafe fn init(options: &InitOptions) -> Result<&'static InitReport> {
         }
         return Ok(&rt.report);
     }
-    let mut state = INIT_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = FATAL.get() {
+        return Err(e.clone());
+    }
+    // Counted from before the lock is taken until after it is released
+    // (declaration order: `_serial` drops first).
+    let _active = OWNER.enter_init();
+    let _serial = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(rt) = RUNTIME.get() {
         if rt.requested_path != options.library_path {
             return Err(Error::AlreadyInitialized);
         }
         return Ok(&rt.report);
     }
-    if let Some(e) = state.as_ref() {
+    if let Some(e) = FATAL.get() {
         return Err(e.clone());
     }
     let stamp = Stamp::now();
@@ -252,11 +273,13 @@ pub unsafe fn init(options: &InitOptions) -> Result<&'static InitReport> {
                 requested_path: options.library_path.clone(),
             };
             let _ = RUNTIME.set(rt);
+            OWNER.mark_init_done();
             Ok(&RUNTIME.get().expect("runtime was just set").report)
         }
         Err(InitFailure::Retryable(e)) => Err(e),
         Err(InitFailure::Fatal(e)) => {
-            *state = Some(e.clone());
+            let _ = FATAL.set(e.clone());
+            OWNER.mark_init_done();
             Err(e)
         }
     }
@@ -273,15 +296,26 @@ pub fn init_report() -> Option<&'static InitReport> {
 /// When a library is already loaded (by [`init`] or an earlier call), its
 /// information is returned. Otherwise `RUST_DAOS_LIBDFS`, then `"libdfs.so"`
 /// is loaded.
+///
+/// # Errors
+///
+/// The load errors of [`init`], and [`Error::Forked`] in a fork child of a
+/// process in which another thread was inside [`init`] or the library load
+/// at the moment of the fork (the child does not wait for their locks).
+/// A fork child of a process whose [`init`] failed for good (`dfs_init`
+/// failed) also gets [`Error::Forked`], from this function and from [`init`],
+/// instead of the error stored in the parent.
 pub fn library_info() -> Result<LibraryInfo> {
     if let Some(rt) = RUNTIME.get() {
         return Ok(rt.report.library.clone());
     }
+    OWNER.claim()?;
     let lib = loader::load_any()?;
     Ok(loader::info_of(&lib))
 }
 
 /// True when libdfs can be loaded. Never panics, never initialises DAOS.
+/// False where [`library_info`] returns an error, also [`Error::Forked`].
 pub fn is_available() -> bool {
     matches!(std::panic::catch_unwind(library_info), Ok(Ok(_)))
 }
@@ -307,6 +341,9 @@ mod loader {
     /// name is a [`Error::Conflict`]: the crate never loads two libdfs copies.
     pub(super) fn load(requested: Option<&PathBuf>) -> Result<Arc<LibDfs>> {
         let name = resolve_name(requested);
+        // Counted from before the lock is taken until after it is released
+        // (declaration order: `loaded` drops first).
+        let _active = OWNER.enter_loader();
         let mut loaded = LOADED.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((existing, lib)) = loaded.as_ref() {
             if *existing == name {
@@ -326,6 +363,7 @@ mod loader {
     /// The loaded library, or load the default one.
     pub(super) fn load_any() -> Result<Arc<LibDfs>> {
         {
+            let _active = OWNER.enter_loader();
             let loaded = LOADED.lock().unwrap_or_else(|e| e.into_inner());
             if let Some((_, lib)) = loaded.as_ref() {
                 return Ok(lib.clone());

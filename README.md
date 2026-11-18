@@ -354,10 +354,14 @@ libdaos and DFS mount state do not survive `fork`: a read-write mount keeps
 its object ID allocator in process memory, so a parent and a child would hand
 out the same IDs. Every use of the crate in a fork child of a process that
 called `init` returns `Error::Forked`, and dropping inherited handles in the
-child does nothing (no locks, no library calls).
+child does nothing (no locks, no library calls). The same holds when another
+thread of the parent was inside `init` or inside the library load of
+`library_info` at the moment of the fork: the child gets `Error::Forked` at
+once instead of waiting for a lock that thread held.
 
 Supported models: start workers with spawn (or fork then exec), and call
-`init` and `connect` in each process. Forking before `init` is fine.
+`init` and `connect` in each process. Forking before `init` is fine, also
+after a `library_info` probe in the parent.
 
 ## One system per process
 

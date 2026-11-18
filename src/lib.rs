@@ -92,8 +92,12 @@
 //! libdaos and DFS mount state do not survive `fork`. Every use of the crate
 //! in a fork child of a process that called [`init`] returns
 //! [`Error::Forked`], and dropping inherited handles in the child does
-//! nothing. Start workers with spawn (or fork then exec) and call [`init`]
-//! and connect in each process. Forking before [`init`] is fine.
+//! nothing. The same holds when another thread of the parent was inside
+//! [`init`] or inside the library load of [`library_info`] at the moment of
+//! the fork: the child gets [`Error::Forked`] at once instead of waiting for
+//! a lock that thread held. Start workers with spawn (or fork then exec) and
+//! call [`init`] and connect in each process. Forking before [`init`] is
+//! fine, also after a [`library_info`] probe in the parent.
 //!
 //! # One system per process
 //!

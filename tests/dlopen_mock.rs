@@ -553,6 +553,125 @@ fn fork_before_init_is_fine() {
         .unwrap();
 }
 
+/// Wait until `cond` holds; false after 10 s.
+fn wait_for(cond: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + T;
+    while !cond() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    true
+}
+
+/// In a fork child: `init`, `library_info`, `is_available` and a connect all
+/// refuse with `Forked` naming `owner`, without waiting.
+fn child_refuses_process_state(owner: u32) -> i32 {
+    let start = Instant::now();
+    let forked = |r: Result<(), Error>| {
+        matches!(r, Err(Error::Forked { created_pid, current_pid, .. })
+            if created_pid == owner && current_pid != owner)
+    };
+    let mut ok = true;
+    ok &= forked(unsafe { daos::init(&InitOptions::default()) }.map(|_| ()));
+    ok &= forked(daos::library_info().map(|_| ()));
+    ok &= !daos::is_available();
+    ok &= forked(Dfs::connect("pool", "cont").map(|_| ()));
+    ok &= daos::init_report().is_none();
+    let quick = start.elapsed() < Duration::from_secs(2);
+    if !ok {
+        1
+    } else if !quick {
+        2
+    } else {
+        0
+    }
+}
+
+/// A child forked while a parent thread is inside `daos_init` (holding the
+/// init lock) gets `Forked` at once instead of waiting for that lock.
+fn fork_during_daos_init() {
+    std::env::set_var(daos::LIBDFS_ENV, mock_lib(MockVariant::Full));
+    daos::library_info().unwrap();
+    let ctl = MockCtl::open(MockVariant::Full);
+    ctl.set_delay("daos_init", 2000);
+    let t = thread::spawn(|| unsafe { daos::init(&InitOptions::default()) }.map(|_| ()));
+    assert!(wait_for(|| ctl.calls("daos_init") == 1));
+    let parent = std::process::id();
+    let code = fork_and_wait(move || child_refuses_process_state(parent));
+    t.join().unwrap().unwrap();
+    assert_eq!(code, 0, "child checks failed");
+    ctl.set_delay("daos_init", 0);
+    assert_eq!(ctl.trace(), "daos_init\ndfs_init\n");
+    Dfs::connect("pool", "cont")
+        .unwrap()
+        .write("/after", b"1")
+        .unwrap();
+}
+
+/// A child forked while a parent thread is inside the library load of a
+/// pre-init `library_info` (holding the loader lock, inside dlopen) gets
+/// `Forked` at once and never reaches the loader.
+fn fork_during_library_load() {
+    let path = mock_lib(MockVariant::Full);
+    let dir = std::env::temp_dir().join(format!("rust-daos-load-pause-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_var("RUST_DAOS_MOCK_LOAD_PAUSE", &dir);
+    std::env::set_var(daos::LIBDFS_ENV, &path);
+    let t = thread::spawn(daos::library_info);
+    let entered = dir.join("entered");
+    assert!(
+        wait_for(|| entered.exists()),
+        "dlopen never reached the pause"
+    );
+    let parent = std::process::id();
+    let code = fork_and_wait(move || child_refuses_process_state(parent));
+    std::fs::write(dir.join("release"), b"").unwrap();
+    let info = t.join().unwrap().unwrap();
+    std::env::remove_var("RUST_DAOS_MOCK_LOAD_PAUSE");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(code, 0, "child checks failed");
+    assert!(info.path.ends_with("full/libdfs_mock.so"));
+    init_mock(MockVariant::Full);
+}
+
+/// A child of a parent that only probed the library (no init, no thread
+/// inside the loader) takes the process state over and initialises.
+fn fork_after_probe_child_initialises() {
+    std::env::set_var(daos::LIBDFS_ENV, mock_lib(MockVariant::Full));
+    assert!(daos::is_available());
+    let code = fork_and_wait(|| {
+        if daos::library_info().is_err() {
+            return 2;
+        }
+        if unsafe { daos::init(&InitOptions::default()) }.is_err() {
+            return 3;
+        }
+        let dfs = Dfs::connect("pool", "cont").unwrap();
+        dfs.write("/probe-child", b"1").unwrap();
+        i32::from(dfs.read("/probe-child").unwrap() != b"1")
+    });
+    assert_eq!(code, 0);
+    unsafe { daos::init(&InitOptions::default()) }.unwrap();
+}
+
+/// A retryable `daos_init` failure leaves nothing behind: a child forked
+/// afterwards may initialise.
+fn fork_after_retryable_init_failure_child_initialises() {
+    std::env::set_var(daos::LIBDFS_ENV, mock_lib(MockVariant::Full));
+    daos::library_info().unwrap();
+    let ctl = MockCtl::open(MockVariant::Full);
+    ctl.set_fail("daos_init", -2034, 0, 1);
+    unsafe { daos::init(&InitOptions::default()) }.unwrap_err();
+    let code = fork_and_wait(|| match unsafe { daos::init(&InitOptions::default()) } {
+        Ok(_) => i32::from(Dfs::connect("pool", "cont").is_err()),
+        Err(_) => 2,
+    });
+    assert_eq!(code, 0);
+}
+
 fn threads_on_one_file() {
     init_mock(MockVariant::Full);
     let dfs = Dfs::connect("pool", "cont").unwrap();
@@ -882,6 +1001,16 @@ fn main() {
             fork_child_does_not_hang_on_parent_locks,
         ),
         case("fork_before_init_is_fine", fork_before_init_is_fine),
+        case("fork_during_daos_init", fork_during_daos_init),
+        case("fork_during_library_load", fork_during_library_load),
+        case(
+            "fork_after_probe_child_initialises",
+            fork_after_probe_child_initialises,
+        ),
+        case(
+            "fork_after_retryable_init_failure_child_initialises",
+            fork_after_retryable_init_failure_child_initialises,
+        ),
         case("threads_on_one_file", threads_on_one_file),
     ];
     run_main(&cases, prepare_mocks);

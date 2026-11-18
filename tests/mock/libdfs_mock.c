@@ -12,6 +12,11 @@
 //
 // Build variants: -DOMIT_DFS_STAT leaves out a required symbol.
 //
+// Load pause: when RUST_DAOS_MOCK_LOAD_PAUSE names a directory, the library
+// constructor creates "entered" in it and waits (up to 10 s) until "release"
+// exists, so a test can fork while another thread is inside dlopen. Without
+// the variable the constructor does nothing.
+//
 // Calls and error paths only; layouts are checked by the ABI probe.
 
 #include <errno.h>
@@ -51,6 +56,24 @@ typedef struct {
 typedef struct dfs     dfs_t;
 typedef struct dfs_obj dfs_obj_t;
 typedef int (*dfs_filler_cb_t)(dfs_t *dfs, dfs_obj_t *obj, const char name[], void *arg);
+
+__attribute__((constructor)) static void
+mock_load_pause(void)
+{
+	const char *dir = getenv("RUST_DAOS_MOCK_LOAD_PAUSE");
+	char        path[4096];
+	int         fd;
+
+	if (dir == NULL || dir[0] == 0)
+		return;
+	snprintf(path, sizeof(path), "%s/entered", dir);
+	fd = open(path, O_CREAT | O_WRONLY, 0600);
+	if (fd >= 0)
+		close(fd);
+	snprintf(path, sizeof(path), "%s/release", dir);
+	for (int i = 0; i < 1000 && access(path, F_OK) != 0; i++)
+		usleep(10000);
+}
 
 /* From libdaos_mock.so.2. */
 int mock_enter(const char *name, int *rc);

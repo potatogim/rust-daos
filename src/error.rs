@@ -231,7 +231,7 @@ pub enum Error {
     /// DAOS used in a fork child.
     #[non_exhaustive]
     Forked {
-        /// Process that initialised DAOS or created the handle.
+        /// Process that loaded or initialised DAOS, or created the handle.
         created_pid: u32,
         /// Current process.
         current_pid: u32,
@@ -531,7 +531,7 @@ impl fmt::Display for Error {
                 current_pid,
             } => write!(
                 f,
-                "DAOS used in a fork child (initialised in pid {created_pid}, now pid {current_pid}). \
+                "DAOS used in a fork child (DAOS state of pid {created_pid}, now pid {current_pid}). \
                  libdaos and DFS mount state do not survive fork. Start workers with spawn, or fork \
                  before daos::init and initialise in each process."
             ),
@@ -713,7 +713,7 @@ mod tests {
             current_pid: 1250,
         };
         assert!(e.to_string().starts_with(
-            "DAOS used in a fork child (initialised in pid 1234, now pid 1250). libdaos and DFS \
+            "DAOS used in a fork child (DAOS state of pid 1234, now pid 1250). libdaos and DFS \
              mount state do not survive fork."
         ));
     }
