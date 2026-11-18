@@ -1,9 +1,10 @@
 // Copyright (c) 2026 Jihyeon Gim
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Shared helpers for the subprocess-based test binaries (`harness = false`).
+//! Shared helpers for the test binaries, mostly for the subprocess-based ones
+//! (`harness = false`).
 //!
-//! Every case that depends on process-global state (`daos::init`, the
+//! In those, every case that depends on process-global state (`daos::init`, the
 //! environment, fork, the system and pool-mode rules) runs in its own
 //! subprocess: the test binary re-executes itself with `RUST_DAOS_CASE=<name>`
 //! and checks the child's exit status and output.
@@ -532,4 +533,21 @@ pub fn init_mock(v: MockVariant) -> &'static daos::InitReport {
     let opts = daos::InitOptions::new().library_path(mock_lib(v));
     // SAFETY: test subprocess, called before any thread is started.
     unsafe { daos::init(&opts) }.expect("init against the C mock")
+}
+
+/// `prefix` followed by components of at most 200 bytes, `n` bytes long
+/// in total (`n` at least `prefix.len() + 2`).
+pub fn path_of_len(prefix: &str, n: usize) -> String {
+    let mut p = prefix.to_string();
+    while p.len() < n {
+        let room = n - p.len();
+        let take = if room <= 201 {
+            room - 1
+        } else {
+            200.min(room - 3)
+        };
+        p.push('/');
+        p.push_str(&"x".repeat(take));
+    }
+    p
 }

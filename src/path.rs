@@ -12,6 +12,8 @@ use crate::error::{Error, Result};
 /// Longest component DFS accepts (`DFS_MAX_NAME`, which is `NAME_MAX`).
 pub const MAX_NAME: usize = 255;
 /// `DFS_MAX_PATH` (`PATH_MAX`); a normalised path must be shorter than this.
+/// The longest accepted normalised path is `MAX_PATH - 1` bytes, as in
+/// `dfs_lookup`.
 pub const MAX_PATH: usize = 4096;
 
 /// Normalise a DFS path.
@@ -125,6 +127,23 @@ pub(crate) fn is_at_or_below(path: &str, dir: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// `prefix` followed by components of at most 200 bytes, `n` bytes long
+    /// in total (`n` at least `prefix.len() + 2`).
+    fn path_of_len(prefix: &str, n: usize) -> String {
+        let mut p = prefix.to_string();
+        while p.len() < n {
+            let room = n - p.len();
+            let take = if room <= 201 {
+                room - 1
+            } else {
+                200.min(room - 3)
+            };
+            p.push('/');
+            p.push_str(&"x".repeat(take));
+        }
+        p
+    }
+
     #[test]
     fn normalisation_table() {
         let cases = [
@@ -160,6 +179,15 @@ mod tests {
             p.push_str(&comp);
         }
         assert!(matches!(normalize(&p), Err(Error::InvalidPath { .. })));
+        // Exactly at the limit, counting the leading slash.
+        let at = path_of_len("", MAX_PATH - 1);
+        assert_eq!(at.len(), 4095);
+        assert_eq!(normalize(&at).unwrap(), at);
+        let over = path_of_len("", MAX_PATH);
+        assert_eq!(over.len(), 4096);
+        assert!(matches!(normalize(&over), Err(Error::InvalidPath { .. })));
+        // A trailing slash is dropped before the length is checked.
+        assert_eq!(normalize(&format!("{at}/")).unwrap(), at);
         // A long input that normalises to something short is accepted.
         let back = format!("{}z", "a/../".repeat(2000));
         assert_eq!(normalize(&back).unwrap(), "/z");

@@ -3,6 +3,8 @@
 
 //! Public API over the in-memory backend (feature `mock`). No DAOS needed.
 
+mod common;
+
 use std::io::Write as _;
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -813,4 +815,41 @@ fn send_sync_and_threads() {
     }
     assert_eq!(rx.iter().count(), 16);
     assert_eq!(names(&dfs, "/own").len(), 16);
+}
+
+/// The longest accepted normalised path is `MAX_PATH - 1` = 4095 bytes,
+/// counting the leading slash; 4096 bytes is refused before any call.
+#[test]
+fn path_limits_at_4095_and_4096_bytes() {
+    let (m, dfs) = mount();
+    let at = common::path_of_len("", daos::path::MAX_PATH - 1);
+    assert_eq!(at.len(), 4095);
+    dfs.write(&at, b"edge").unwrap();
+    assert_eq!(dfs.read(&at).unwrap(), b"edge");
+    assert!(dfs.metadata(&at).unwrap().is_file());
+    let over = common::path_of_len("", daos::path::MAX_PATH);
+    assert_eq!(over.len(), 4096);
+    let ops = [
+        "dfs_lookup",
+        "dfs_open",
+        "dfs_mkdir",
+        "dfs_stat",
+        "dfs_remove",
+    ];
+    let before: Vec<u64> = ops.iter().map(|o| m.calls(o)).collect();
+    assert!(matches!(
+        dfs.write(&over, b"x"),
+        Err(Error::InvalidPath { .. })
+    ));
+    assert!(matches!(
+        dfs.metadata(&over),
+        Err(Error::InvalidPath { .. })
+    ));
+    assert!(matches!(
+        dfs.create_dir_all(&over),
+        Err(Error::InvalidPath { .. })
+    ));
+    let after: Vec<u64> = ops.iter().map(|o| m.calls(o)).collect();
+    assert_eq!(before, after, "a refused path makes no backend call");
+    dfs.remove_file(&at).unwrap();
 }

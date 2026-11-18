@@ -259,6 +259,28 @@ fn read_dir_3000() {
     finish(dfs, &base);
 }
 
+/// libdfs accepts a 4095-byte path (`DFS_MAX_PATH - 1`); the crate refuses
+/// 4096 bytes before any call.
+fn path_limits() {
+    let (_e, dfs, base) = setup();
+    let at = common::path_of_len(&base, daos::path::MAX_PATH - 1);
+    assert_eq!(at.len(), 4095);
+    dfs.write(&at, b"edge").unwrap();
+    assert_eq!(dfs.read(&at).unwrap(), b"edge");
+    assert!(dfs.metadata(&at).unwrap().is_file());
+    let over = common::path_of_len(&base, daos::path::MAX_PATH);
+    assert_eq!(over.len(), 4096);
+    assert!(matches!(
+        dfs.write(&over, b"x"),
+        Err(Error::InvalidPath { .. })
+    ));
+    assert!(matches!(
+        dfs.metadata(&over),
+        Err(Error::InvalidPath { .. })
+    ));
+    finish(dfs, &base);
+}
+
 fn read_only_mount() {
     let e = env();
     unsafe { daos::init(&InitOptions::default()) }.unwrap();
@@ -664,6 +686,7 @@ fn main() {
         case("write_read_sizes_and_sparse", write_read_sizes_and_sparse),
         case("errors_and_directories", errors_and_directories),
         case("read_dir_3000", read_dir_3000),
+        case("path_limits", path_limits),
         case("read_only_mount", read_only_mount),
         case(
             "unknown_pool_and_system_conflict",
