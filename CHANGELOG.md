@@ -8,7 +8,61 @@ Versions before 1.0 may change the API in minor releases. MSRV bumps are a
 minor-version change and are listed here.
 
 ## [Unreleased]
+
+## [0.1.1] - 2026-11-20
 ### Fixed
+- Fork during initialisation no longer hangs the child. A child forked while
+  another thread of the parent was inside `init`, inside the library load of
+  `library_info` or `is_available`, or inside the registration of the
+  crate's atfork handler, waited for ever on a lock or `Once` that thread
+  held. A child forked during `init` before its result was stored, or during
+  the library load, now gets `Error::Forked` at once from `init`,
+  `library_info` and every connect (`is_available` returns false). A child
+  forked while the fork detection was being set up is not refused; it sets
+  the detection up itself. A child of a parent that only probed the library,
+  or whose `daos_init` failed, may still initialise. A child of a parent
+  whose `dfs_init` failed gets `Error::Forked` from `library_info` and from
+  `init`, not the error stored in the parent. A child forked after a parent
+  thread released one of these locks but before it lowered its counter is
+  refused as well.
+- A process is no longer taken for the owner of the crate's state, or for
+  the maker of a handle, because its process id matches (a child in a new
+  PID namespace can have its parent's id), and a child made with a raw
+  `clone` is refused on the checked calls that use inherited state (those
+  listed under Processes in the README), not only on the calls that
+  compared process ids. The crate keeps a token in a page that the kernel
+  clears in every child (`MADV_WIPEONFORK`, Linux 4.14 and newer) and reads
+  it on the checked calls; `library_info`, `is_available` and `init_report`
+  answer from a stored report without reading it. Where that page cannot
+  be set up it compares the kernel's process id with the recorded one on
+  those calls and uses a
+  `pthread_atfork` handler; there a descendant with the recorded process id
+  is recognised only if a `fork` of the C library lies between, after the
+  handler was installed, and the first use of the crate in a raw `clone`
+  child of a multithreaded process may wait on a lock of the C library.
+- Process ids are read from the kernel. The C library's `getpid()` could
+  return the parent's id in a child made with a raw `clone` (glibc before
+  2.25). Where the page cannot be set up, a process whose `getpid` system
+  call is denied is refused, and `init` then fails before it loads the
+  library; `Error::Forked` carries 0 for an unknown id.
+- `ReadDir::next` returns `Error::Forked` once in a fork child, also when
+  names were buffered before the fork, then `None`, and frees nothing in
+  these calls. An iterator that had already ended with an error before the
+  fork keeps returning `None` in the child, as it does in the parent.
+- A cached pool, container or mount whose process check fails is no longer
+  taken for a closed one: the call returns `Error::Forked` where it could
+  open a second connection or let a forced `destroy_container` pass a
+  container that is open in this process.
+- `close` on an inherited handle returns `Error::Forked` before any DAOS
+  call when the process check at entry fails, as before. It now also
+  reports that error when the process that owns the last pool or container
+  reference cannot be confirmed during cleanup; the native release of that
+  handle is skipped, and an unmount or container close already done is not
+  undone. A container whose handle was left open this way, or whose
+  `daos_cont_close` failed, stays busy for `destroy_container` in this
+  process, as does one whose last `daos_cont_close` is still running.
+  Connections that a registry lookup or a destroy check found are dropped
+  only after the registry lock was released.
 - `Container::close` never reaches `daos_cont_close` while a DFS mount of
   the container is still being unmounted, by a dropped `Dfs` or by a
   `Dfs::close` in another thread, or while a directory handle of the mount
@@ -48,6 +102,26 @@ minor-version change and are listed here.
   mount, until it drops that hold on return (in 0.1.0 only while it waited
   on the mount itself); after a `Busy` each of them works again when it is
   still open and its last waiting close has returned.
+- The result of `pthread_atfork` is checked; a failed installation is tried
+  again later.
+- Docs: in a refused fork child `library_info`, `is_available` and
+  `init_report` answer with the parent's data when the parent's `init` had
+  stored its report.
+- The docs build without features (the crate-level text named
+  `mock::MemDfs` as a link).
+- `path::MAX_PATH` docs state the longest accepted normalised path:
+  `MAX_PATH - 1` = 4095 bytes, as in `dfs_lookup`; tests at 4095 and 4096
+  bytes.
+
+### Tests
+- `multi_engine_ec_objects` is split by class (`_ec_2p1` needs 3 engines,
+  `_ec_4p1` needs 5) and uses `rd_fac` 1 at rank level; every multi-engine
+  case skips with its reason when the pool spans too few engines, and the
+  node-level redundancy case runs only with `RUST_DAOS_TEST_NODES` of 3 or
+  more. The runner lists skips by reason.
+- The `enumeration` case inserts 2,000 keys per class on 8 threads sharing
+  one object (`RUST_DAOS_ENUM_KEYS` raises the count) and times each
+  listing pass.
 
 ## [0.1.0] - 2026-11-18
 ### Added
@@ -90,7 +164,7 @@ minor-version change and are listed here.
   and the libdaos layer.
 - MSRV 1.77.
 
-### Changed (relative to earlier development snapshots)
+### Changed
 - `Dfs::connect` opens the pool and container itself and mounts with
   `dfs_mount` instead of `dfs_connect`; it opens existing containers only.
   Connect errors are `Error::Daos` with `op` `daos_pool_connect` or
@@ -108,5 +182,6 @@ minor-version change and are listed here.
   enumeration memory allocated inside libdfs.
 - No `Container::set_label`, named snapshots, event queues.
 
-[Unreleased]: https://github.com/potatogim/rust-daos/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/potatogim/rust-daos/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/potatogim/rust-daos/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/potatogim/rust-daos/releases/tag/v0.1.0
