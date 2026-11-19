@@ -368,6 +368,17 @@ impl Container {
     /// container are open at the deadline; nothing is closed then and the
     /// connection accepts calls again. Idempotent. Dropping every view
     /// without `close` closes quietly.
+    ///
+    /// On an inherited handle `close` returns [`Error::Forked`] before any
+    /// DAOS call when the process check at entry fails. It also returns that
+    /// error when, during cleanup, the container held the last reference of
+    /// its pool connection and this process cannot be confirmed as the one
+    /// that connected it: the disconnect is skipped, and the container close
+    /// already done is not undone. When several cleanup steps fail, the
+    /// error returned is the first of: the `daos_cont_close` error, the error
+    /// of the pool release (this one or a `daos_pool_disconnect` error), an
+    /// error closing an object handle, an error unmounting a DFS mount of the
+    /// container.
     pub fn close(&self, timeout: Duration) -> Result<()> {
         self.conn.close(timeout)
     }

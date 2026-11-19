@@ -23,7 +23,9 @@
 //! key with a live entry returns that entry. Label and UUID strings of the
 //! same pool or container are different keys. The registry lock is never held
 //! during a DAOS call: a connect in progress reserves its key, and a second
-//! request for the same key waits for it.
+//! request for the same key waits for it. A connection upgraded from the
+//! registry under the lock is dropped only after the lock is released, since
+//! dropping the last reference closes it.
 //!
 //! One DAOS system per process: the first successful connect fixes it.
 
@@ -158,8 +160,17 @@ impl PoolConn {
         })
     }
 
+    /// For places without an error to return: a failed process check reads
+    /// as "not usable".
     pub(crate) fn is_usable(&self) -> bool {
         !self.done.load(Ordering::SeqCst) && !self.stamp.is_foreign() && !self.gate.is_closed()
+    }
+
+    /// Whether this connection can serve a new user. An error when this
+    /// process is not, or cannot be shown to be, the one that opened it.
+    pub(crate) fn usable(&self) -> Result<bool> {
+        self.stamp.check_cold()?;
+        Ok(!self.done.load(Ordering::SeqCst) && !self.gate.is_closed())
     }
 
     /// Enter a pool operation.
@@ -203,17 +214,24 @@ impl PoolConn {
 
     /// Give up one lease and disconnect when it was the last one, reporting
     /// the error of `daos_pool_disconnect`.
+    ///
+    /// When this process cannot be confirmed as the one that connected, the
+    /// handle is marked done (its drop makes no DAOS call) and the error of
+    /// the check is returned.
+    ///
+    /// Of two releases of the last two leases at once, exactly one gets the
+    /// connection and reports.
     pub(crate) fn release(this: Arc<PoolConn>) -> Result<()> {
-        match Arc::try_unwrap(this) {
-            Ok(p) => {
-                if p.stamp.is_foreign() {
-                    p.done.store(true, Ordering::SeqCst);
-                    return Ok(());
-                }
-                p.disconnect()
-            }
-            Err(_) => Ok(()),
+        let Some(p) = Arc::into_inner(this) else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        crate::fork::testing::fault_point("pool_release");
+        if let Err(e) = p.stamp.check_cold() {
+            p.done.store(true, Ordering::SeqCst);
+            return Err(e);
         }
+        p.disconnect()
     }
 }
 
@@ -252,6 +270,12 @@ pub(crate) struct ContConn {
     /// Pool string of the lease (for errors and registry keys).
     pub(crate) pool_name: String,
     done: AtomicBool,
+    /// True from `daos_cont_open` until a `daos_cont_close` of this handle
+    /// succeeded; shared with the registry (`RegistryInner::open_conts`), so
+    /// a destroy sees the native handle also when the connection is gone or
+    /// being dropped. Stays true for a handle that is never closed (a failed
+    /// close, or a close skipped after a failed process check).
+    native_open: Arc<AtomicBool>,
 }
 
 impl ContConn {
@@ -299,6 +323,7 @@ impl ContConn {
             pool_name: pool.name.clone(),
             pool: Mutex::new(Some(pool)),
             done: AtomicBool::new(false),
+            native_open: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -316,8 +341,17 @@ impl ContConn {
         format!("{}/{}", self.pool_name, self.name)
     }
 
+    /// For places without an error to return: a failed process check reads
+    /// as "not usable".
     pub(crate) fn is_usable(&self) -> bool {
         !self.done.load(Ordering::SeqCst) && !self.stamp.is_foreign() && !self.gate.is_closed()
+    }
+
+    /// Whether this connection can serve a new user. An error when this
+    /// process is not, or cannot be shown to be, the one that opened it.
+    pub(crate) fn usable(&self) -> Result<bool> {
+        self.stamp.check_cold()?;
+        Ok(!self.done.load(Ordering::SeqCst) && !self.gate.is_closed())
     }
 
     /// Enter a container operation.
@@ -336,8 +370,10 @@ impl ContConn {
         // `done`); mounts and objects of this container were released first.
         let rc = unsafe { self.backend.daos_cont_close(self.coh, std::ptr::null_mut()) };
         let closed = if rc != 0 {
+            // The handle may still be open in libdaos: `native_open` stays.
             Err(Error::daos_at("daos_cont_close", rc, self.target()))
         } else {
+            self.native_open.store(false, Ordering::SeqCst);
             Ok(())
         };
         let pool = self.pool.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -425,14 +461,25 @@ impl ContConn {
 
     /// Give up one lease. When it was the last one, close the container and
     /// release its pool lease; the first error is reported.
+    ///
+    /// When this process cannot be confirmed as the one that opened the
+    /// container, the handle is marked done (its drop makes no DAOS call for
+    /// it) and the error of the check is returned. The pool lease goes with
+    /// the connection as usual.
+    ///
+    /// Of two releases of the last two leases at once, exactly one gets the
+    /// connection and reports.
     pub(crate) fn release(this: Arc<ContConn>) -> Result<()> {
-        let c = match Arc::try_unwrap(this) {
-            Ok(c) => c,
-            Err(_) => return Ok(()),
-        };
-        if c.stamp.is_foreign() {
-            c.done.store(true, Ordering::SeqCst);
+        let Some(c) = Arc::into_inner(this) else {
             return Ok(());
+        };
+        #[cfg(test)]
+        crate::fork::testing::fault_point("cont_release");
+        if let Err(e) = c.stamp.check_cold() {
+            // No close: `native_open` stays true, so a destroy of this
+            // container stays busy in this process.
+            c.done.store(true, Ordering::SeqCst);
+            return Err(e);
         }
         c.finish()
     }
@@ -441,7 +488,9 @@ impl ContConn {
 impl Drop for ContConn {
     fn drop(&mut self) {
         if self.stamp.is_foreign() {
-            return; // fork child: leak, never call libdaos
+            // Fork child, or a process check that failed: leak, never call
+            // libdaos. `native_open` stays true.
+            return;
         }
         // Object handles hold leases, so none is open here.
         let _ = self.finish();
@@ -470,6 +519,10 @@ pub(crate) struct RegistryInner {
     pools: HashMap<(String, Access), Weak<PoolConn>>,
     conts: HashMap<(String, String, Access), Weak<ContConn>>,
     pub(crate) mounts: HashMap<(String, String, Access), Weak<crate::dfs::Mount>>,
+    /// `(pool, container, native_open)` of every container connection made
+    /// through this registry whose native handle was not closed yet. Entries
+    /// with a cleared flag are dropped when a connection is stored.
+    open_conts: Vec<(String, String, Arc<AtomicBool>)>,
 }
 
 impl RegistryInner {
@@ -507,19 +560,75 @@ impl RegistryInner {
     }
 
     /// True when a container or mount of `(pool, cont)` is live or being
-    /// opened, in any access mode.
-    pub(crate) fn container_in_use(&self, pool: &str, cont: &str) -> bool {
+    /// opened, in any access mode, or when a native handle of it is still
+    /// open: being closed by a connection that the registry can no longer
+    /// reach, or left open for good (see `open_conts`). An error when a live
+    /// entry cannot be shown to belong to this process.
+    ///
+    /// Every connection and mount upgraded here is moved into `upgraded`,
+    /// for the caller to drop after it released the registry lock.
+    pub(crate) fn container_in_use(
+        &self,
+        pool: &str,
+        cont: &str,
+        upgraded: &mut Upgraded,
+    ) -> Result<bool> {
         let pending = self.pending.iter().any(|k| match k {
             Key::Cont(p, c, _) | Key::Mount(p, c, _) => p == pool && c == cont,
             Key::Pool(..) => false,
         });
-        let live_cont = self.conts.iter().any(|((p, c, _), w)| {
-            p == pool && c == cont && w.upgrade().is_some_and(|x| x.is_usable())
-        });
-        let live_mount = self.mounts.iter().any(|((p, c, _), w)| {
-            p == pool && c == cont && w.upgrade().is_some_and(|m| !m.is_closed())
-        });
-        pending || live_cont || live_mount
+        if pending {
+            return Ok(true);
+        }
+        for ((p, c, _), w) in &self.conts {
+            if p == pool && c == cont {
+                if let Some(x) = w.upgrade() {
+                    #[cfg(test)]
+                    run_after_upgrade();
+                    let usable = x.usable();
+                    upgraded.conts.push(x);
+                    if usable? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        for ((p, c, _), w) in &self.mounts {
+            if p == pool && c == cont {
+                if let Some(m) = w.upgrade() {
+                    let live = m.live();
+                    upgraded.mounts.push(m);
+                    if live? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(self
+            .open_conts
+            .iter()
+            .any(|(p, c, open)| p == pool && c == cont && open.load(Ordering::SeqCst)))
+    }
+}
+
+/// Connections and mounts upgraded under the registry lock, dropped by the
+/// owner after the lock was released.
+#[derive(Default)]
+pub(crate) struct Upgraded {
+    conts: Vec<Arc<ContConn>>,
+    mounts: Vec<Arc<crate::dfs::Mount>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run once right after `container_in_use` upgraded a container.
+    static AFTER_UPGRADE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_after_upgrade() {
+    if let Some(f) = AFTER_UPGRADE.with(|h| h.borrow_mut().take()) {
+        f();
     }
 }
 
@@ -577,27 +686,59 @@ impl Registry {
 
     /// Return the live entry for `key` (found with `lookup`) or create it with
     /// `create` without holding the lock, then record it with `store`.
+    ///
+    /// An error of `lookup` (a cached entry whose process check fails) is
+    /// returned before anything is reserved: such an entry is neither used
+    /// nor replaced by a second connection.
     pub(crate) fn acquire<T>(
         &self,
         key: Key,
         sys_key: &str,
         lookup: impl Fn(&RegistryInner) -> Option<Arc<T>>,
+        usable: impl Fn(&T) -> Result<bool>,
         create: impl FnOnce() -> Result<Arc<T>>,
         store: impl FnOnce(&mut RegistryInner, &Arc<T>),
     ) -> Result<Arc<T>> {
+        // Entries found but not used: dropped only after the lock is
+        // released (dropping the last reference closes the connection).
+        let mut unused: Vec<Arc<T>> = Vec::new();
         let mut inner = self.lock();
         loop {
-            inner.check_system(sys_key)?;
+            if let Err(e) = inner.check_system(sys_key) {
+                drop(inner);
+                drop(unused);
+                return Err(e);
+            }
             if let Some(found) = lookup(&inner) {
-                return Ok(found);
+                match usable(&found) {
+                    Ok(true) => {
+                        drop(inner);
+                        drop(unused);
+                        return Ok(found);
+                    }
+                    Ok(false) => unused.push(found),
+                    Err(e) => {
+                        drop(inner);
+                        unused.push(found);
+                        drop(unused);
+                        return Err(e);
+                    }
+                }
             }
             if !inner.pending.contains(&key) {
                 break;
             }
-            inner = self.changed.wait(inner).unwrap_or_else(|e| e.into_inner());
+            // Look again only once the reservation of this key is gone, so
+            // an entry is set aside at most once per reservation, not once
+            // per notification of the shared condition variable.
+            inner = self
+                .changed
+                .wait_while(inner, |i| i.pending.contains(&key))
+                .unwrap_or_else(|e| e.into_inner());
         }
         inner.reserve(&key, sys_key);
         drop(inner);
+        drop(unused);
         // Unreserves the key if `create` panics, so later requests for it
         // do not wait forever.
         let mut reservation = Reservation {
@@ -622,8 +763,22 @@ impl Registry {
     /// under these strings; otherwise opens of these keys wait until the
     /// guard drops. The lock is not held during the destroy call.
     pub(crate) fn reserve_destroy(&self, pool: &str, cont: &str) -> Result<DestroyGuard<'_>> {
+        let mut upgraded = Upgraded::default();
+        let r = self.reserve_destroy_with(pool, cont, &mut upgraded);
+        // The lock is released: a last reference may close its connection
+        // now.
+        drop(upgraded);
+        r
+    }
+
+    fn reserve_destroy_with(
+        &self,
+        pool: &str,
+        cont: &str,
+        upgraded: &mut Upgraded,
+    ) -> Result<DestroyGuard<'_>> {
         let mut inner = self.lock();
-        if inner.container_in_use(pool, cont) {
+        if inner.container_in_use(pool, cont, upgraded)? {
             return Err(Error::busy_open(1));
         }
         let mut keys = Vec::new();
@@ -658,15 +813,11 @@ impl Registry {
         self.acquire(
             Key::Pool(name.to_string(), access),
             &sys_key,
-            |r| {
-                r.pools
-                    .get(&map_key)
-                    .and_then(Weak::upgrade)
-                    .filter(|p| p.is_usable())
-            },
+            |r| r.pools.get(&map_key).and_then(Weak::upgrade),
+            PoolConn::usable,
             || {
-                PoolConn::connect(backend.clone(), name, sys_name, access, Stamp::now())
-                    .map(Arc::new)
+                let stamp = Stamp::fresh()?;
+                PoolConn::connect(backend.clone(), name, sys_name, access, stamp).map(Arc::new)
             },
             |r, p| {
                 r.pools.retain(|_, w| w.strong_count() > 0);
@@ -700,17 +851,358 @@ impl Registry {
         self.acquire(
             Key::Cont(pool.name.clone(), cont.to_string(), pool.access),
             &sys_key,
-            |r| {
-                r.conts
-                    .get(&map_key)
-                    .and_then(Weak::upgrade)
-                    .filter(|c| c.is_usable())
+            |r| r.conts.get(&map_key).and_then(Weak::upgrade),
+            ContConn::usable,
+            || {
+                let stamp = Stamp::fresh()?;
+                ContConn::open(pool.clone(), cont, stamp).map(Arc::new)
             },
-            || ContConn::open(pool.clone(), cont, Stamp::now()).map(Arc::new),
             |r, c| {
                 r.conts.retain(|_, w| w.strong_count() > 0);
                 r.conts.insert(map_key.clone(), Arc::downgrade(c));
+                r.open_conts.retain(|e| e.2.load(Ordering::SeqCst));
+                r.open_conts.push((
+                    c.pool_name.clone(),
+                    c.name.clone(),
+                    Arc::clone(&c.native_open),
+                ));
             },
         )
+    }
+}
+
+#[cfg(all(test, feature = "mock"))]
+mod tests {
+    use super::*;
+    use crate::fork::testing::{
+        count_raw_pid_reads, force_plain, rerun_alone, with_pid_fault_at, with_raw_pid_once_after,
+    };
+    use crate::mock::MemDfs;
+    use crate::pool::PoolOptions;
+    use crate::{Dfs, Pool};
+
+    const RW: Access = Access::ReadWrite;
+    const SECS: Duration = Duration::from_secs(5);
+
+    /// Plain mode first, then the backend, then its init.
+    fn plain_mock() -> (Arc<MemDfs>, Arc<dyn Raw>) {
+        force_plain();
+        let mem = Arc::new(MemDfs::new());
+        mem.ensure_init().unwrap();
+        let backend: Arc<dyn Raw> = mem.clone();
+        (mem, backend)
+    }
+
+    fn is_forked<T>(r: &Result<T>) -> bool {
+        matches!(r, Err(Error::Forked { .. }))
+    }
+
+    /// A lookup that filters with a boolean takes the failed check for a
+    /// closed entry, drops it and connects again (a second
+    /// `daos_pool_connect2` and a second handle), wherever the stamp for the
+    /// new connection is taken.
+    #[test]
+    fn failed_pid_read_keeps_the_cached_pool() {
+        if rerun_alone("conn::tests::failed_pid_read_keeps_the_cached_pool") {
+            return;
+        }
+        let (mem, backend) = plain_mock();
+        let registry = backend.registry();
+        let p1 = registry.pool(&backend, "p", None, RW).unwrap();
+        assert_eq!(mem.calls("daos_pool_connect2"), 1);
+        assert_eq!(mem.open_pool_handles(), 1);
+        // A healthy cached hit of the same call; the entry's check is its
+        // last pid read.
+        let call = || registry.pool(&backend, "p", None, RW);
+        let mut hit = None;
+        let n = count_raw_pid_reads(|| hit = Some(call()));
+        assert!(n >= 1);
+        assert!(Arc::ptr_eq(&hit.unwrap().unwrap(), &p1));
+        let r = with_raw_pid_once_after(n - 1, -1, call);
+        assert!(is_forked(&r), "{:?}", r.err());
+        assert_eq!(mem.calls("daos_pool_connect2"), 1);
+        assert_eq!(mem.open_pool_handles(), 1);
+        assert!(Arc::ptr_eq(&call().unwrap(), &p1));
+        assert_eq!(mem.calls("daos_pool_connect2"), 1);
+        assert_eq!(mem.open_pool_handles(), 1);
+    }
+
+    /// A lookup that filters with a boolean opens the container a second
+    /// time.
+    #[test]
+    fn failed_pid_read_keeps_the_cached_container() {
+        if rerun_alone("conn::tests::failed_pid_read_keeps_the_cached_container") {
+            return;
+        }
+        let (mem, backend) = plain_mock();
+        let registry = backend.registry();
+        let p = registry.pool(&backend, "p", None, RW).unwrap();
+        let c1 = registry.container_on(&p, "c").unwrap();
+        assert_eq!(mem.calls("daos_cont_open2"), 1);
+        let call = || registry.container_on(&p, "c");
+        let mut hit = None;
+        let n = count_raw_pid_reads(|| hit = Some(call()));
+        assert!(n >= 1);
+        assert!(Arc::ptr_eq(&hit.unwrap().unwrap(), &c1));
+        let r = with_raw_pid_once_after(n - 1, -1, call);
+        assert!(is_forked(&r), "{:?}", r.err());
+        assert_eq!(mem.calls("daos_cont_open2"), 1);
+        assert!(Arc::ptr_eq(&call().unwrap(), &c1));
+        assert_eq!(mem.calls("daos_cont_open2"), 1);
+    }
+
+    /// Positive control: an entry that is really closed is replaced.
+    #[test]
+    fn closed_entry_is_still_replaced() {
+        if rerun_alone("conn::tests::closed_entry_is_still_replaced") {
+            return;
+        }
+        let (mem, backend) = plain_mock();
+        let registry = backend.registry();
+        let p1 = registry.pool(&backend, "p", None, RW).unwrap();
+        p1.close(SECS).unwrap();
+        let p2 = registry.pool(&backend, "p", None, RW).unwrap();
+        assert_eq!(mem.calls("daos_pool_connect2"), 2);
+        assert!(!Arc::ptr_eq(&p1, &p2));
+
+        let c = registry.container_on(&p2, "c").unwrap();
+        let options = crate::dfs::MountOptions::default();
+        let m1 = crate::dfs::mount_on(&c, None, &options).unwrap();
+        m1.close(SECS).unwrap();
+        let m2 = crate::dfs::mount_on(&c, None, &options).unwrap();
+        assert_eq!(mem.calls("dfs_mount"), 2);
+        assert!(!Arc::ptr_eq(&m1, &m2));
+    }
+
+    /// With a boolean check the container looks unused, the reservation
+    /// succeeds and the forced destroy reaches DAOS (`daos_cont_destroy2`
+    /// becomes 1).
+    #[test]
+    fn failed_pid_read_does_not_free_a_container_for_destroy() {
+        if rerun_alone("conn::tests::failed_pid_read_does_not_free_a_container_for_destroy") {
+            return;
+        }
+        let (mem, backend) = plain_mock();
+        let registry = backend.registry();
+        let pool = Pool::connect_mock(mem.clone(), &PoolOptions::new("p")).unwrap();
+        let _cont = pool.open_container("c").unwrap();
+        let mut first = None;
+        let n = count_raw_pid_reads(|| first = Some(pool.destroy_container("c", true)));
+        assert!(matches!(first, Some(Err(Error::Busy { .. }))));
+        let k = count_raw_pid_reads(|| {
+            assert!(matches!(
+                registry.reserve_destroy("p", "c"),
+                Err(Error::Busy { .. })
+            ));
+        });
+        assert!(k >= 1 && n >= k);
+        // The first read inside the reservation fails, all others are
+        // healthy.
+        let r = with_raw_pid_once_after(n - k, -1, || pool.destroy_container("c", true));
+        assert!(is_forked(&r), "{:?}", r.err());
+        assert_eq!(mem.calls("daos_cont_destroy2"), 0);
+        let r = with_raw_pid_once_after(0, -1, || registry.reserve_destroy("p", "c").map(|_| ()));
+        assert!(is_forked(&r), "{:?}", r.err());
+        assert!(matches!(
+            pool.destroy_container("c", true),
+            Err(Error::Busy { .. })
+        ));
+        assert_eq!(mem.calls("daos_cont_destroy2"), 0);
+    }
+
+    /// The process check inside `ContConn::release` fails after the entry
+    /// check of `close` passed. An implementation that answers `Ok` here
+    /// fails.
+    #[test]
+    fn container_release_reports_a_failed_process_check() {
+        if rerun_alone("conn::tests::container_release_reports_a_failed_process_check") {
+            return;
+        }
+        let (mem, _) = plain_mock();
+        // A separate view of the pool of the mount: the pool reference of the
+        // container is not the last one. Were it the last, dropping it later,
+        // once the pid reads again, would attempt a disconnect, which the
+        // mock refuses with -DER_BUSY while the skipped container handle is
+        // open; marking the container done does not prevent that attempt.
+        let pool = Pool::connect_mock(mem.clone(), &PoolOptions::new("mock")).unwrap();
+        let dfs = Dfs::connect_mock(mem.clone()).unwrap();
+        let umount = mem.calls("dfs_umount");
+        let cont_close = mem.calls("daos_cont_close");
+        let disconnect = mem.calls("daos_pool_disconnect");
+        let r = with_pid_fault_at("cont_release", || dfs.close(SECS));
+        assert!(is_forked(&r), "{:?}", r.err());
+        assert_eq!(mem.calls("dfs_umount"), umount + 1);
+        assert_eq!(mem.calls("daos_cont_close"), cont_close);
+        assert_eq!(mem.calls("daos_pool_disconnect"), disconnect);
+        drop(dfs);
+        assert_eq!(mem.calls("daos_pool_disconnect"), disconnect);
+        // The native container handle is still open: a forced destroy is
+        // refused although no connection of the container is left.
+        assert!(matches!(
+            pool.destroy_container("mock", true),
+            Err(Error::Busy { .. })
+        ));
+        assert_eq!(mem.calls("daos_cont_destroy2"), 0);
+        drop(pool);
+        // The container was marked done: no close for it, also now.
+        assert_eq!(mem.calls("daos_cont_close"), cont_close);
+    }
+
+    /// The last reference of a container drops while a destroy scans the
+    /// registry: the scan's own reference is the last one. Its close runs
+    /// only after the registry lock was released, so while that close is
+    /// held in the mock a registry call for another key completes. A close
+    /// that fails keeps the container busy for later destroys.
+    #[test]
+    fn last_reference_dropped_during_the_destroy_scan() {
+        if rerun_alone("conn::tests::last_reference_dropped_during_the_destroy_scan") {
+            return;
+        }
+        let (mem, backend) = plain_mock();
+        let registry = backend.registry();
+        let p = registry.pool(&backend, "p", None, RW).unwrap();
+        let c = registry.container_on(&p, "c").unwrap();
+        mem.fail_next("daos_cont_close", -1012);
+        let pause = mem.pause_next("daos_cont_close");
+        let scan = {
+            let backend = backend.clone();
+            std::thread::spawn(move || {
+                // After the scan upgraded the container, the only other
+                // reference goes.
+                AFTER_UPGRADE.with(|h| *h.borrow_mut() = Some(Box::new(move || drop(c))));
+                let r = backend.registry().reserve_destroy("p", "c").map(|_| ());
+                let hook_ran = AFTER_UPGRADE.with(|h| h.borrow().is_none());
+                (r, hook_ran)
+            })
+        };
+        assert!(pause.wait_entered(SECS), "the last close never started");
+        // The scan thread is inside daos_cont_close; the registry is free.
+        let other = registry.pool(&backend, "q", None, RW).unwrap();
+        drop(other);
+        pause.release();
+        let (r, hook_ran) = scan.join().unwrap();
+        assert!(hook_ran, "hook not run");
+        assert!(matches!(r, Err(Error::Busy { .. })), "{r:?}");
+        assert_eq!(mem.calls("daos_cont_close"), 1);
+        // No connection is left; the failed close keeps the destroy busy.
+        assert!(registry
+            .lock()
+            .conts
+            .values()
+            .all(|w| w.upgrade().is_none()));
+        assert!(matches!(
+            registry.reserve_destroy("p", "c"),
+            Err(Error::Busy { .. })
+        ));
+        let pool = Pool::connect_mock(mem.clone(), &PoolOptions::new("p")).unwrap();
+        assert!(matches!(
+            pool.destroy_container("c", true),
+            Err(Error::Busy { .. })
+        ));
+        assert_eq!(mem.calls("daos_cont_destroy2"), 0);
+    }
+
+    /// The last reference of a container is dropped and its
+    /// `daos_cont_close` is still running: a forced destroy is busy and makes
+    /// no DAOS call. Once the close succeeded the container can be destroyed.
+    #[test]
+    fn destroy_during_the_last_close_is_busy() {
+        if rerun_alone("conn::tests::destroy_during_the_last_close_is_busy") {
+            return;
+        }
+        let mem = Arc::new(MemDfs::new());
+        let pool = Pool::connect_mock(mem.clone(), &PoolOptions::new("p")).unwrap();
+        let cont = pool.open_container("c").unwrap();
+        let pause = mem.pause_next("daos_cont_close");
+        let t = std::thread::spawn(move || drop(cont));
+        assert!(pause.wait_entered(SECS));
+        let registry = mem.registry();
+        assert!(registry
+            .lock()
+            .conts
+            .values()
+            .all(|w| w.upgrade().is_none()));
+        assert!(matches!(
+            pool.destroy_container("c", true),
+            Err(Error::Busy { .. })
+        ));
+        assert_eq!(mem.calls("daos_cont_destroy2"), 0);
+        pause.release();
+        t.join().unwrap();
+        assert_eq!(mem.calls("daos_cont_close"), 1);
+        // The record went with the successful close.
+        pool.destroy_container("c", true).unwrap();
+        assert_eq!(mem.calls("daos_cont_destroy2"), 1);
+        // Later connections under one name leave nothing behind once their
+        // closes succeeded: storing a connection drops the entries of
+        // handles that were closed.
+        let first = pool.open_container("e").unwrap();
+        first.close(SECS).unwrap();
+        let again = pool.open_container("e").unwrap();
+        {
+            let inner = registry.lock();
+            assert_eq!(inner.open_conts.len(), 1, "closed entries were kept");
+            assert!(inner.open_conts[0].2.load(Ordering::SeqCst));
+        }
+        again.close(SECS).unwrap();
+        assert!(registry
+            .lock()
+            .open_conts
+            .iter()
+            .all(|(_, _, open)| !open.load(Ordering::SeqCst)));
+        pool.destroy_container("e", true).unwrap();
+        assert_eq!(mem.calls("daos_cont_destroy2"), 2);
+    }
+
+    /// The last two leases of a pool are released by two threads at once:
+    /// exactly one of them gets the connection and reports the failed
+    /// disconnect. With "try to take it, else drop the lease" both can miss
+    /// it, and the last drop disconnects without a report.
+    #[test]
+    fn concurrent_last_releases_report_once() {
+        use std::sync::Barrier;
+        const ROUNDS: usize = 5_000;
+        let mem = Arc::new(MemDfs::new());
+        mem.ensure_init().unwrap();
+        let backend: Arc<dyn Raw> = mem.clone();
+        let registry = backend.registry();
+        let barrier = Arc::new(Barrier::new(2));
+        for round in 0..ROUNDS {
+            let p = registry.pool(&backend, "p", None, RW).unwrap();
+            mem.fail_next("daos_pool_disconnect", -1003);
+            let other = Arc::clone(&p);
+            let b = Arc::clone(&barrier);
+            let t = std::thread::spawn(move || {
+                b.wait();
+                PoolConn::release(other)
+            });
+            barrier.wait();
+            let mine = PoolConn::release(p);
+            let theirs = t.join().unwrap();
+            let errors = usize::from(mine.is_err()) + usize::from(theirs.is_err());
+            assert_eq!(errors, 1, "round {round}: {mine:?} {theirs:?}");
+        }
+    }
+
+    /// The process check inside `PoolConn::release` fails after the entry
+    /// check of `close` passed.
+    #[test]
+    fn pool_release_reports_a_failed_process_check() {
+        if rerun_alone("conn::tests::pool_release_reports_a_failed_process_check") {
+            return;
+        }
+        let (mem, _) = plain_mock();
+        let pool = Pool::connect_mock(mem.clone(), &PoolOptions::new("p")).unwrap();
+        let cont = pool.open_container("c").unwrap();
+        // The container's connection now holds the last pool reference.
+        drop(pool);
+        let cont_close = mem.calls("daos_cont_close");
+        let disconnect = mem.calls("daos_pool_disconnect");
+        let r = with_pid_fault_at("pool_release", || cont.close(SECS));
+        assert!(is_forked(&r), "{:?}", r.err());
+        assert_eq!(mem.calls("daos_cont_close"), cont_close + 1);
+        assert_eq!(mem.calls("daos_pool_disconnect"), disconnect);
+        drop(cont);
+        assert_eq!(mem.calls("daos_pool_disconnect"), disconnect);
     }
 }

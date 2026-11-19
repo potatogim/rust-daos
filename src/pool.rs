@@ -449,6 +449,14 @@ impl Pool {
     /// `force`: close your own handles first. An open handle under another
     /// string (UUID versus label) is not detected; DAOS then refuses the
     /// destroy without `force`.
+    ///
+    /// The same `Busy` holds while the last close of such a handle runs, and
+    /// for the rest of the process when that close failed or was skipped
+    /// (a close whose process check failed): the crate cannot show that the
+    /// handle is closed and never closes it later. The block is by pool and
+    /// container string, so a container that another process destroys and
+    /// creates again under the same label stays blocked in this process as
+    /// well.
     pub fn destroy_container(&self, cont: &str, force: bool) -> Result<()> {
         // Before any lock: a fork child must not wait for a lock a parent
         // thread held at the fork.
@@ -493,6 +501,9 @@ impl Pool {
     /// containers or DFS mounts of the pool are still open at the deadline;
     /// nothing is closed then. Idempotent. Dropping every view without
     /// `close` disconnects quietly.
+    ///
+    /// On an inherited handle `close` returns [`Error::Forked`] before any
+    /// DAOS call when the process check at entry fails.
     pub fn close(&self, timeout: Duration) -> Result<()> {
         self.conn.close(timeout)
     }

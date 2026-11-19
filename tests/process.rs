@@ -210,8 +210,118 @@ fn fork_after_mock_use_reaches_the_loader() {
     ));
 }
 
+/// A directory `dir` with `n` files.
+fn dir_with(dfs: &Dfs, dir: &str, n: usize) {
+    dfs.create_dir(dir).unwrap();
+    for i in 0..n {
+        dfs.write(&format!("{dir}/f{i}"), b"").unwrap();
+    }
+}
+
+/// The child part of the iterator cases: `Forked` once, then `None`.
+fn refused_once_then_none(iter: &mut daos::ReadDir) -> i32 {
+    if !matches!(iter.next(), Some(Err(Error::Forked { .. }))) {
+        return 1;
+    }
+    if iter.next().is_some() {
+        return 2;
+    }
+    0
+}
+
+/// A raw clone child (no atfork handler runs, its own pid) is refused on
+/// every call of inherited handles.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn raw_clone_child_is_refused_on_every_call() {
+    use daos::cont::ContainerOptions;
+    use daos::obj::{ClassHints, ObjectClass, ObjectType};
+    let mem = Arc::new(MemDfs::new());
+    let dfs = Dfs::connect_mock(mem.clone()).unwrap();
+    dfs.write("/f", b"abc").unwrap();
+    dir_with(&dfs, "/d", 2);
+    let file = dfs.open("/f").unwrap();
+    let c = daos::Container::open_mock(mem.clone(), &ContainerOptions::new("p", "c")).unwrap();
+    let ids = c.oid_allocator();
+    let next = || {
+        ids.next(
+            ObjectType::MultiHashed,
+            ObjectClass::S1,
+            ClassHints::default(),
+        )
+    };
+    next().unwrap();
+    let mut iter = dfs.read_dir("/d").unwrap();
+    assert!(matches!(iter.next(), Some(Ok(_))));
+    let code = raw_clone_and_wait(|| {
+        let mut ok = true;
+        ok &= is_forked(file.size());
+        ok &= is_forked(file.read_at(&mut [0u8; 3], 0));
+        ok &= is_forked(dfs.metadata("/f"));
+        ok &= is_forked(next());
+        ok &= is_forked(Dfs::connect_mock(mem.clone()));
+        ok &= is_forked(iter.next().unwrap());
+        i32::from(!ok)
+    });
+    assert_eq!(code, 0);
+    assert_eq!(file.size().unwrap(), 3);
+    next().unwrap();
+    assert!(matches!(iter.next(), Some(Ok(_))));
+}
+
+/// More names than one batch of 1,024: names were buffered at the fork.
+fn fork_child_iterator_refuses_buffered_names() {
+    let dfs = Dfs::connect_mock(Arc::new(MemDfs::new())).unwrap();
+    dir_with(&dfs, "/d", 1_100);
+    let mut iter = dfs.read_dir("/d").unwrap();
+    assert!(matches!(iter.next(), Some(Ok(_))));
+    assert_eq!(fork_and_wait(|| refused_once_then_none(&mut iter)), 0);
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    assert_eq!(raw_clone_and_wait(|| refused_once_then_none(&mut iter)), 0);
+    let mut seen = 1;
+    for e in iter {
+        e.unwrap();
+        seen += 1;
+    }
+    assert_eq!(seen, 1_100);
+}
+
+/// The listing reached its end: the last names are buffered at the fork.
+fn fork_child_iterator_refuses_the_final_batch() {
+    let dfs = Dfs::connect_mock(Arc::new(MemDfs::new())).unwrap();
+    dir_with(&dfs, "/d", 3);
+    let mut iter = dfs.read_dir("/d").unwrap();
+    assert!(matches!(iter.next(), Some(Ok(_))));
+    assert_eq!(fork_and_wait(|| refused_once_then_none(&mut iter)), 0);
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    assert_eq!(raw_clone_and_wait(|| refused_once_then_none(&mut iter)), 0);
+    assert!(matches!(iter.next(), Some(Ok(_))));
+    assert!(matches!(iter.next(), Some(Ok(_))));
+    assert!(iter.next().is_none());
+}
+
+/// An iterator that ended with an error before the fork stays ended.
+fn fork_child_of_a_failed_iterator_gets_none() {
+    let mem = Arc::new(MemDfs::new());
+    let dfs = Dfs::connect_mock(mem.clone()).unwrap();
+    dfs.create_dir("/e").unwrap();
+    mem.fail_next("dfs_iterate", libc::EIO);
+    let mut iter = dfs.read_dir("/e").unwrap();
+    assert!(iter.next().unwrap().is_err());
+    assert_eq!(fork_and_wait(|| i32::from(iter.next().is_some())), 0);
+    assert!(iter.next().is_none());
+}
+
 fn main() {
-    let cases = [
+    let mut cases = vec![
         case(
             "fork_child_does_not_hang_on_registry_or_allocator_locks",
             fork_child_does_not_hang_on_registry_or_allocator_locks,
@@ -230,6 +340,26 @@ fn main() {
             "fork_after_mock_use_reaches_the_loader",
             fork_after_mock_use_reaches_the_loader,
         ),
+        case(
+            "fork_child_iterator_refuses_buffered_names",
+            fork_child_iterator_refuses_buffered_names,
+        ),
+        case(
+            "fork_child_iterator_refuses_the_final_batch",
+            fork_child_iterator_refuses_the_final_batch,
+        ),
+        case(
+            "fork_child_of_a_failed_iterator_gets_none",
+            fork_child_of_a_failed_iterator_gets_none,
+        ),
     ];
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    cases.push(case(
+        "raw_clone_child_is_refused_on_every_call",
+        raw_clone_child_is_refused_on_every_call,
+    ));
     run_main(&cases, Vec::new);
 }

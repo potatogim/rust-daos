@@ -88,6 +88,11 @@ unsafe extern "C" fn filler(
 /// [`Dfs::metadata`](crate::Dfs::metadata) call per entry. After an error the
 /// iterator ends.
 ///
+/// In a fork child `next` returns [`Error::Forked`](crate::Error::Forked)
+/// once, also when names were buffered, and then `None`. An iterator that
+/// had already ended with an error before the fork returns `None`. These
+/// calls free nothing; dropping the iterator releases its memory as usual.
+///
 /// Known limitation: on a directory whose object class is an erasure-code
 /// class, libdaos attaches memory to the listing anchor and frees it only
 /// when the listing reaches its end. Dropping the iterator earlier leaves
@@ -100,6 +105,8 @@ pub struct ReadDir {
     anchor: Box<daos_anchor_t>,
     pending: VecDeque<OsString>,
     done: bool,
+    /// An error was returned; `next` returns `None` from now on.
+    failed: bool,
 }
 
 impl fmt::Debug for ReadDir {
@@ -120,6 +127,7 @@ impl ReadDir {
             anchor: Box::new(daos_anchor_t::new()),
             pending: VecDeque::new(),
             done: false,
+            failed: false,
         }
     }
 
@@ -175,6 +183,15 @@ impl Iterator for ReadDir {
     type Item = Result<DirEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        if let Err(e) = self.mount.stamp.check() {
+            // Leave the buffered names alone: freeing them could wait for an
+            // allocator lock that a thread of the parent held at the fork.
+            self.failed = true;
+            return Some(Err(e));
+        }
         loop {
             if let Some(name) = self.pending.pop_front() {
                 return Some(Ok(DirEntry {
@@ -186,6 +203,7 @@ impl Iterator for ReadDir {
                 return None;
             }
             if let Err(e) = self.fetch() {
+                self.failed = true;
                 self.done = true;
                 self.pending.clear();
                 return Some(Err(e));
@@ -198,5 +216,47 @@ impl DirEntry {
     /// Entry name as bytes.
     pub fn name_bytes(&self) -> &[u8] {
         self.name.as_bytes()
+    }
+}
+
+#[cfg(all(test, feature = "mock"))]
+mod tests {
+    use crate::fork::testing::{fork_child, wait_child};
+    use crate::mock::MemDfs;
+    use crate::{Dfs, Error};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn refusal_keeps_the_buffered_names() {
+        let dfs = Dfs::connect_mock(Arc::new(MemDfs::new())).unwrap();
+        dfs.create_dir("/d").unwrap();
+        for name in ["a", "b", "c"] {
+            dfs.write(&format!("/d/{name}"), b"x").unwrap();
+        }
+        let mut iter = dfs.read_dir("/d").unwrap();
+        assert!(matches!(iter.next(), Some(Ok(_))));
+        let n = iter.pending.len();
+        assert_eq!(n, 2);
+        let child = fork_child(|| {
+            if !matches!(iter.next(), Some(Err(Error::Forked { .. }))) {
+                return 1;
+            }
+            if iter.pending.len() != n {
+                return 2;
+            }
+            if iter.next().is_some() {
+                return 3;
+            }
+            if iter.pending.len() != n {
+                return 4;
+            }
+            // Leaves with _exit, without dropping the iterator.
+            0
+        });
+        assert_eq!(wait_child(child, Duration::from_secs(30)), 0);
+        assert!(matches!(iter.next(), Some(Ok(_))));
+        assert!(matches!(iter.next(), Some(Ok(_))));
+        assert!(iter.next().is_none());
     }
 }

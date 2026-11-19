@@ -220,6 +220,15 @@ impl Mount {
         self.gate.is_closed()
     }
 
+    /// Whether the mount is open. An error when this process is not, or
+    /// cannot be shown to be, the one that mounted it. One pid read: not
+    /// `is_closed()`, which asks the stamp again and would turn a failed
+    /// second read into "closed".
+    pub(crate) fn live(&self) -> Result<bool> {
+        self.stamp.check_cold()?;
+        Ok(!self.gate.is_closed())
+    }
+
     /// True while the `dfs_t` is mounted: before the teardown, and after a
     /// teardown whose `dfs_umount` failed (the mount then keeps its
     /// container lease).
@@ -364,8 +373,7 @@ impl Mount {
 
     /// The container connection, or `Closed` after unmount.
     fn container_conn(&self) -> Result<Arc<ContConn>> {
-        self.stamp.check()?;
-        if self.is_closed() {
+        if !self.live()? {
             return Err(Error::Closed);
         }
         self.cont
@@ -633,7 +641,6 @@ pub(crate) fn mount(
     registry: &Registry,
     backend: Arc<dyn Raw>,
     opts: &ConnectOptions,
-    stamp: Stamp,
 ) -> Result<Arc<Mount>> {
     opts.validate()?;
     let sys = opts.sys_name.as_deref();
@@ -648,15 +655,15 @@ pub(crate) fn mount(
         Key::Mount(opts.pool.clone(), opts.container.clone(), access),
         &sys_key,
         |r| {
-            r.mounts
-                .get(&(opts.pool.clone(), opts.container.clone(), access))
-                .and_then(Weak::upgrade)
-                .filter(|m| !m.is_closed())
+            let key = (opts.pool.clone(), opts.container.clone(), access);
+            r.mounts.get(&key).and_then(Weak::upgrade)
         },
+        Mount::live,
         || {
             let attempt = || {
                 let cont =
                     registry.container(&backend, &opts.pool, &opts.container, sys, access)?;
+                let stamp = Stamp::fresh()?;
                 new_mount(cont, opts.sys_name.clone(), opts.dir_cache_capacity, stamp)
             };
             match attempt() {
@@ -682,21 +689,18 @@ pub(crate) fn mount_on(
     registry.acquire::<Mount>(
         Key::Mount(key.0.clone(), key.1.clone(), key.2),
         &sys_key,
-        |r| {
-            r.mounts
-                .get(&key)
-                .and_then(Weak::upgrade)
-                .filter(|m| !m.is_closed())
-        },
+        |r| r.mounts.get(&key).and_then(Weak::upgrade),
+        Mount::live,
         || {
-            if !cont.is_usable() {
+            if !cont.usable()? {
                 return Err(Error::Closed);
             }
+            let stamp = Stamp::fresh()?;
             new_mount(
                 cont.clone(),
                 sys_name.clone(),
                 options.dir_cache_capacity,
-                Stamp::now(),
+                stamp,
             )
         },
         store_mount,
@@ -834,12 +838,7 @@ impl Dfs {
     /// the same label.
     pub fn connect_with(options: &ConnectOptions) -> Result<Dfs> {
         let rt = crate::runtime::runtime()?;
-        let mount = mount(
-            rt.backend.registry(),
-            rt.backend.clone(),
-            options,
-            Stamp::now(),
-        )?;
+        let mount = mount(rt.backend.registry(), rt.backend.clone(), options)?;
         Ok(Dfs { mount })
     }
 
@@ -860,7 +859,7 @@ impl Dfs {
         backend.stamp().check_cold()?;
         backend.ensure_init()?;
         let raw: Arc<dyn Raw> = backend.clone();
-        let mount = mount(backend.registry(), raw, options, Stamp::now())?;
+        let mount = mount(backend.registry(), raw, options)?;
         Ok(Dfs { mount })
     }
 
@@ -1226,6 +1225,19 @@ impl Dfs {
     ///
     /// [`Error::Busy`] when operations still run after `timeout`; the mount is
     /// then left connected and accepts operations again.
+    ///
+    /// On an inherited handle `close` returns [`Error::Forked`] before any
+    /// DAOS call when the process check at entry fails. It also returns that
+    /// error when, during cleanup, the mount held the last reference of its
+    /// container connection (or that one the last reference of its pool
+    /// connection) and this process cannot be confirmed as the one that
+    /// opened it: the native release of that handle is skipped, and the
+    /// unmount or container close already done is not undone. A failed
+    /// `dfs_umount` is returned before any other error (the container is then
+    /// left open). After a successful unmount, when several cleanup steps
+    /// fail, the error returned is the first of: a `dfs_release` error, then
+    /// the error of the container release (this one or a `daos_cont_close`
+    /// error), then that of the pool release.
     pub fn close(&self, timeout: Duration) -> Result<()> {
         self.mount.close(timeout)
     }
@@ -1256,3 +1268,86 @@ const _: () = {
     send::<Writer>();
     send::<ReadDir>();
 };
+
+#[cfg(all(test, feature = "mock"))]
+mod tests {
+    use super::*;
+    use crate::fork::testing::{
+        count_raw_pid_reads, force_plain, rerun_alone, with_raw_pid_after, with_raw_pid_once_after,
+    };
+    use crate::mock::MemDfs;
+
+    /// Plain mode first, then the backend, then its init, then a container
+    /// connection of the registry.
+    fn plain_container() -> (Arc<MemDfs>, Arc<dyn Raw>, Arc<ContConn>) {
+        force_plain();
+        let mem = Arc::new(MemDfs::new());
+        mem.ensure_init().unwrap();
+        let backend: Arc<dyn Raw> = mem.clone();
+        let registry = backend.registry();
+        let p = registry
+            .pool(&backend, "p", None, Access::ReadWrite)
+            .unwrap();
+        let c = registry.container_on(&p, "c").unwrap();
+        (mem, backend, c)
+    }
+
+    fn is_forked<T>(r: &Result<T>) -> bool {
+        matches!(r, Err(Error::Forked { .. }))
+    }
+
+    /// A lookup that filters with a boolean mounts a second time.
+    #[test]
+    fn failed_pid_read_keeps_the_cached_mount() {
+        if rerun_alone("dfs::tests::failed_pid_read_keeps_the_cached_mount") {
+            return;
+        }
+        let (mem, backend, c) = plain_container();
+        let options = MountOptions::default();
+        let m1 = mount_on(&c, None, &options).unwrap();
+        assert_eq!(mem.calls("dfs_mount"), 1);
+
+        let call = || mount_on(&c, None, &options);
+        let mut hit = None;
+        let n = count_raw_pid_reads(|| hit = Some(call()));
+        assert!(n >= 1);
+        assert!(Arc::ptr_eq(&hit.unwrap().unwrap(), &m1));
+        let r = with_raw_pid_once_after(n - 1, -1, call);
+        assert!(is_forked(&r), "{:?}", r.err());
+        assert_eq!(mem.calls("dfs_mount"), 1);
+        assert!(Arc::ptr_eq(&call().unwrap(), &m1));
+        assert_eq!(mem.calls("dfs_mount"), 1);
+
+        let opts = ConnectOptions::new("p", "c");
+        let call = || mount(backend.registry(), backend.clone(), &opts);
+        let mut hit = None;
+        let n = count_raw_pid_reads(|| hit = Some(call()));
+        assert!(n >= 1);
+        assert!(Arc::ptr_eq(&hit.unwrap().unwrap(), &m1));
+        let r = with_raw_pid_once_after(n - 1, -1, call);
+        assert!(is_forked(&r), "{:?}", r.err());
+        assert_eq!(mem.calls("dfs_mount"), 1);
+        assert!(Arc::ptr_eq(&call().unwrap(), &m1));
+        assert_eq!(mem.calls("dfs_mount"), 1);
+    }
+
+    /// A `live()` that asks the stamp twice takes a failed second read for
+    /// "closed" and goes on to mount again.
+    #[test]
+    fn cached_mount_is_found_with_one_pid_read() {
+        if rerun_alone("dfs::tests::cached_mount_is_found_with_one_pid_read") {
+            return;
+        }
+        let (mem, _, c) = plain_container();
+        let options = MountOptions::default();
+        let m1 = mount_on(&c, None, &options).unwrap();
+        let mut r = None;
+        let n = count_raw_pid_reads(|| {
+            // One healthy read, every later read fails.
+            r = Some(with_raw_pid_after(1, -1, || mount_on(&c, None, &options)));
+        });
+        assert!(Arc::ptr_eq(&r.unwrap().unwrap(), &m1));
+        assert_eq!(mem.calls("dfs_mount"), 1);
+        assert_eq!(n, 1);
+    }
+}

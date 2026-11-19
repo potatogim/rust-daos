@@ -228,12 +228,16 @@ pub enum Error {
         /// What is not offered.
         what: &'static str,
     },
-    /// DAOS used in a fork child.
+    /// DAOS state used in a fork child, or in a process that cannot be shown
+    /// to own it: where the crate falls back to comparing process ids (see
+    /// the Processes part of the README), a process whose process id cannot
+    /// be read is refused as well, also when it never forked.
     #[non_exhaustive]
     Forked {
-        /// Process that loaded or initialised DAOS, or created the handle.
+        /// Process that loaded or initialised DAOS, or created the handle; 0
+        /// when that process id is not known.
         created_pid: u32,
-        /// Current process.
+        /// Current process; 0 when its process id is not known.
         current_pid: u32,
     },
     /// The mount, pool or container connection was closed.
@@ -529,6 +533,26 @@ impl fmt::Display for Error {
             Error::Forked {
                 created_pid,
                 current_pid,
+            } if *created_pid == 0 || *current_pid == 0 => {
+                let pid = |p: u32| {
+                    if p == 0 {
+                        "unknown".to_string()
+                    } else {
+                        p.to_string()
+                    }
+                };
+                write!(
+                    f,
+                    "DAOS state not shown to belong to this process: a process id could not be \
+                     read (DAOS state of pid {}, now pid {}). The crate refuses inherited DAOS \
+                     state where it cannot tell a fork child from its parent.",
+                    pid(*created_pid),
+                    pid(*current_pid)
+                )
+            }
+            Error::Forked {
+                created_pid,
+                current_pid,
             } => write!(
                 f,
                 "DAOS used in a fork child (DAOS state of pid {created_pid}, now pid {current_pid}). \
@@ -715,6 +739,14 @@ mod tests {
         assert!(e.to_string().starts_with(
             "DAOS used in a fork child (DAOS state of pid 1234, now pid 1250). libdaos and DFS \
              mount state do not survive fork."
+        ));
+        let e = Error::Forked {
+            created_pid: 1234,
+            current_pid: 0,
+        };
+        assert!(e.to_string().starts_with(
+            "DAOS state not shown to belong to this process: a process id could not be read \
+             (DAOS state of pid 1234, now pid unknown)."
         ));
     }
 

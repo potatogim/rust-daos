@@ -37,9 +37,11 @@ single-engine DAOS system in a Rocky Linux 9 container on the runner:
   pinned to the engine's interface (it offered `docker0` otherwise) and
   `bdev_exclude` for the host's NVMe controllers (the runner's root disk is
   NVMe).
-- `ci/daos/test.sh build|real_daos|real_daos_obj`: builds and runs the
+- `ci/daos/test.sh build|fork|real_daos|real_daos_obj`: builds and runs the
   suites in the container with `RUST_DAOS_REQUIRE_REAL=1` and
-  `RUST_DAOS_EXPECT_DAOS` set from the DAOS version.
+  `RUST_DAOS_EXPECT_DAOS` set from the DAOS version; `fork` runs the fork
+  detection unit tests (`cargo test --lib fork::tests::`) with
+  `RUST_DAOS_REQUIRE_WIPE=1`.
 - `ci/daos/down.sh`: stops DAOS, removes the container and puts back the
   host settings `up.sh` changed (see below). On failure the job uploads the
   server, engine, agent and client logs as `daos-logs-<version>`.
@@ -93,6 +95,31 @@ saved values.
 The file bdev and the logs go to `target/daos-ct` (`DAOS_CT_WORK`). The
 container mounts its own hugetlbfs and has its own IPC namespace, so it
 leaves no hugepage files or SysV shared memory on the host.
+
+## Fork detection
+
+The unit tests in `src/fork.rs` and the `process` and `dlopen_mock` cases
+check how a child is told apart from its parent. Children are made with
+`fork` and, on Linux x86_64 and aarch64, with a raw `clone` system call (no
+atfork handler runs there). New cases:
+
+- `process`: `raw_clone_child_is_refused_on_every_call`,
+  `fork_child_iterator_refuses_buffered_names` (more than one batch of
+  names), `fork_child_iterator_refuses_the_final_batch`,
+  `fork_child_of_a_failed_iterator_gets_none`.
+- `dlopen_mock`: `raw_clone_child_is_refused_after_init`, and
+  `fork_child_with_equal_pid_is_refused`, which runs a child with the same
+  process id as its parent (PID 1 of a new nested PID namespace, inside a
+  new user namespace). Where namespaces cannot be made it is skipped with
+  the exit code and errno of the failed step (76: `unshare`, 78: `clone`).
+
+The crate prefers a page the kernel clears in children (`MADV_WIPEONFORK`,
+Linux 4.14 and newer) and falls back to comparing process ids. Cases that
+need the page print a note and return where it is not available;
+`RUST_DAOS_REQUIRE_WIPE=1` (set on CI) makes them fail instead. It does not
+affect the namespace skip. Unit tests that change process-wide state (plain
+mode, a failed pid read) run again alone in a child process of the test
+binary.
 
 ## Cases that run only with `--ignored`
 

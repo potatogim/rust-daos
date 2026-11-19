@@ -218,7 +218,9 @@ pub(crate) fn runtime() -> Result<&'static Runtime> {
 ///   or whose `init` failed for good (the child gets `Forked`, not the stored
 ///   `dfs_init` error), or in which another thread was inside `init` or the
 ///   library load at the moment of the fork. The child does not wait for locks that a parent
-///   thread held.
+///   thread held. Also where the process id cannot be read and the kernel
+///   cannot clear the crate's token page in children; nothing is loaded then
+///   and the call can be repeated.
 ///
 /// # Example
 ///
@@ -233,6 +235,19 @@ pub(crate) fn runtime() -> Result<&'static Runtime> {
 /// }
 /// ```
 pub unsafe fn init(options: &InitOptions) -> Result<&'static InitReport> {
+    init_with(options, |path| {
+        let lib = loader::load(path)?;
+        let info = loader::info_of(&lib);
+        let backend: Arc<dyn Raw> = lib;
+        Ok((backend, info))
+    })
+}
+
+/// `init` over a given loader (unit tests pass their own backend).
+fn init_with(
+    options: &InitOptions,
+    load: impl FnOnce(Option<&PathBuf>) -> Result<(Arc<dyn Raw>, LibraryInfo)>,
+) -> Result<&'static InitReport> {
     // Before any lock: a fork child must not wait for the init lock or the
     // loader lock that a parent thread held at the fork.
     OWNER.claim()?;
@@ -259,10 +274,11 @@ pub unsafe fn init(options: &InitOptions) -> Result<&'static InitReport> {
     if let Some(e) = FATAL.get() {
         return Err(e.clone());
     }
-    let stamp = Stamp::now();
-    let lib = loader::load(options.library_path.as_ref())?;
-    let info = loader::info_of(&lib);
-    let backend: Arc<dyn Raw> = lib;
+    // Before anything is loaded or initialised: a runtime stored with a
+    // stamp that fails its own check would refuse this very process for
+    // good.
+    let stamp = Stamp::fresh()?;
+    let (backend, info) = load(options.library_path.as_ref())?;
     let getenv = |k: &str| std::env::var_os(k).map(|v| v.to_string_lossy().into_owned());
     match run_init_sequence(backend.as_ref(), info, &getenv) {
         Ok(report) => {
@@ -515,6 +531,77 @@ mod tests {
         let w = mr_cache_warnings(Some("1"), Some("0"));
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("CRT_MRC_ENABLE=\"1\""));
+    }
+
+    /// A loader that hands out `fake` and counts its calls.
+    fn loader_of<'a>(
+        fake: &Arc<Counting>,
+        loads: &'a AtomicUsize,
+    ) -> impl Fn(Option<&PathBuf>) -> Result<(Arc<dyn Raw>, LibraryInfo)> + 'a {
+        let fake = fake.clone();
+        move |_| {
+            loads.fetch_add(1, Ordering::SeqCst);
+            let backend: Arc<dyn Raw> = fake.clone();
+            Ok((backend, info()))
+        }
+    }
+
+    #[test]
+    fn init_stores_no_runtime_without_a_pid() {
+        use crate::fork::testing::{force_plain, rerun_alone, with_raw_pid_after};
+        if rerun_alone("runtime::tests::init_stores_no_runtime_without_a_pid") {
+            return;
+        }
+        force_plain();
+        let fake = Arc::new(Counting::new(0, 0));
+        let loads = AtomicUsize::new(0);
+        let load = loader_of(&fake, &loads);
+        // 1: the entry claim reads a pid, every later read fails.
+        // 2: the claim inside the stamp succeeds as well, its check fails.
+        for n in [1, 2] {
+            let r = with_raw_pid_after(n, -1, || init_with(&InitOptions::default(), &load));
+            assert!(matches!(r, Err(Error::Forked { .. })), "after {n}: {r:?}");
+            assert_eq!(loads.load(Ordering::SeqCst), 0);
+            assert_eq!(fake.daos_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fake.dfs_calls.load(Ordering::SeqCst), 0);
+            assert!(RUNTIME.get().is_none());
+            assert!(init_report().is_none());
+        }
+        assert!(init_with(&InitOptions::default(), &load).is_ok());
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        let rt = runtime().unwrap();
+        assert_ne!(rt.stamp.pid(), 0);
+        assert!(rt.stamp.check_cold().is_ok());
+    }
+
+    #[test]
+    fn fork_child_after_init_is_refused_by_the_owner() {
+        use crate::fork::testing::{fork_child, rerun_alone, wait_child};
+        if rerun_alone("runtime::tests::fork_child_after_init_is_refused_by_the_owner") {
+            return;
+        }
+        let fake = Arc::new(Counting::new(0, 0));
+        let loads = AtomicUsize::new(0);
+        let load = loader_of(&fake, &loads);
+        assert!(init_with(&InitOptions::default(), &load).is_ok());
+        let child = fork_child(|| {
+            // Asked directly, before any stamp of the runtime is looked at.
+            if !matches!(OWNER.claim(), Err(Error::Forked { .. })) {
+                return 1;
+            }
+            if !matches!(runtime(), Err(Error::Forked { .. })) {
+                return 2;
+            }
+            if !matches!(
+                init_with(&InitOptions::default(), &load),
+                Err(Error::Forked { .. })
+            ) {
+                return 3;
+            }
+            i32::from(loads.load(Ordering::SeqCst) != 1)
+        });
+        assert_eq!(wait_child(child, std::time::Duration::from_secs(30)), 0);
+        assert!(runtime().is_ok());
     }
 
     #[test]

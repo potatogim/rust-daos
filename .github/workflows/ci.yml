@@ -39,6 +39,9 @@ jobs:
     env:
       # Fail instead of skip when the C mock cannot be built.
       RUST_DAOS_REQUIRE_MOCK: "1"
+      # Fail when the kernel does not clear the crate's token page in
+      # children (the fork detection would fall back to process ids).
+      RUST_DAOS_REQUIRE_WIPE: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -48,6 +51,8 @@ jobs:
 
   test-no-features:
     runs-on: ubuntu-latest
+    env:
+      RUST_DAOS_REQUIRE_WIPE: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -129,7 +134,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - run: cargo check --all-features --target ${{ matrix.target }}
+      - run: cargo check --all-features --all-targets --target ${{ matrix.target }}
 
   real-daos:
     # real_daos and real_daos_obj against a single-engine DAOS system in a
@@ -214,6 +219,9 @@ jobs:
       - name: build the tests
         timeout-minutes: 10
         run: docker exec rust-daos-ci /src/ci/daos/test.sh build
+      - name: fork detection
+        timeout-minutes: 10
+        run: docker exec rust-daos-ci /src/ci/daos/test.sh fork
       - name: real_daos
         timeout-minutes: 15
         run: docker exec rust-daos-ci /src/ci/daos/test.sh real_daos

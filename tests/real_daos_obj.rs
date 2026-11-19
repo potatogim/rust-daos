@@ -132,7 +132,7 @@ fn sweep_leftovers() {
     }
 }
 
-/// Every planned symbol resolves through the libdfs handle; which names the
+/// Every required symbol resolves through the libdfs handle; which names the
 /// loader used. With `RUST_DAOS_SYMBOLS_OUT=<file>` the lines are written
 /// there too (abi/symbols-installed-<ver>.txt).
 fn symbols() {

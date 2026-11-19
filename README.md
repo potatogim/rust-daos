@@ -352,12 +352,45 @@ which then leaks.
 
 libdaos and DFS mount state do not survive `fork`: a read-write mount keeps
 its object ID allocator in process memory, so a parent and a child would hand
-out the same IDs. Every use of the crate in a fork child of a process that
-called `init` returns `Error::Forked`, and dropping inherited handles in the
-child does nothing (no locks, no library calls). The same holds when another
-thread of the parent was inside `init` or inside the library load of
-`library_info` at the moment of the fork: the child gets `Error::Forked` at
-once instead of waiting for a lock that thread held.
+out the same IDs. The crate refuses to work in a fork child of a process
+that had stored the result of `init` (a report or a `dfs_init` failure), or
+in which a thread was inside `init` or inside the library load of
+`library_info` at the moment of the fork. In such a child these return
+`Error::Forked` before they take a lock of the crate or call DAOS: `init`;
+`connect` of a pool, container or mount; a connect to a `MemDfs` that was
+made before the fork; and every operation that calls DAOS on an inherited
+pool, container, mount, file, object, key-value object or array. `ReadDir`
+returns `Error::Forked` from `next`, also when names were buffered (an
+iterator that had already ended with an error before the fork returns
+`None`). Dropping inherited handles calls nothing in DAOS and takes no lock
+of the crate.
+
+Not covered: a call that fails on its arguments or on a missing library
+symbol may report that instead. Key listings of objects and key-value
+objects may still hand out keys they had buffered before the fork (a
+`KeyBatch` has no way to report an error); the next request to DAOS returns
+`Error::Forked`. A `MemDfs` created in the child is a backend of its own and
+works there.
+
+How a child is recognised: handles and the process state record the process
+that made them. The crate keeps a token in a private page and asks the
+kernel to clear that page in every child (`MADV_WIPEONFORK`, Linux 4.14 and
+newer). Where this works, any other process with its own copy of the address
+space is recognised on each call that checks the process (those listed
+above), however it was created (`fork`, `clone`, `clone3`) and whatever its
+process id. Where the page cannot be set up, the crate compares the
+kernel's process id with the recorded one on those calls and installs a
+`pthread_atfork` handler. A descendant with another process id is then
+still recognised on each of them. A descendant with the recorded
+process id (possible with PID namespaces) is recognised only if it or one of
+its ancestors since the record was made came from the C library's `fork`
+after the handler was installed. In this mode a process whose `getpid`
+system call is denied gets `Error::Forked`, and the first use of the crate
+in a child made with a raw `clone` from a multithreaded process may wait on
+a lock of the C library.
+
+A child that shares its parent's memory (`vfork`, `clone` with `CLONE_VM`,
+which `posix_spawn` uses) must not use the crate before `exec`.
 
 Supported models: start workers with spawn (or fork then exec), and call
 `init` and `connect` in each process. Forking before `init` is fine, also
@@ -377,6 +410,18 @@ have their own registry.
 
 ## Known limitations
 
+- A forced `destroy_container` can race with a `create_container` of a
+  POSIX container under the same label in the same process: while the
+  create is still setting the container up, the destroy is not refused and
+  can remove it.
+- In a child made with a raw `clone` of a multithreaded process,
+  `Dfs::connect`, `Pool::connect`, `Container::open` and
+  `Dfs::connect_mock` build their option values, which allocates memory,
+  before they check the process. Such a call can wait on an allocator lock
+  that another thread of the parent held instead of returning
+  `Error::Forked`. `Dfs::connect_with`, `Pool::connect_with`,
+  `Container::open_with` and `Dfs::connect_mock_with` with options made
+  before the clone do not have this step.
 - Key enumeration of objects of an erasure-code class (`Object::dkeys`,
   `akeys`, `Kv::keys`) returns `Error::Unsupported`. libdaos attaches memory
   to the enumeration anchor on such objects and frees it only when the

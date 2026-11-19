@@ -200,8 +200,15 @@ pub fn run_main(cases: &[Case], prepare: impl FnOnce() -> Vec<(String, String)>)
     }
 }
 
+/// Run a case process in its own process group. The leader is polled with
+/// `WNOWAIT`, so it stays unreaped and its group id cannot be reused; on
+/// exit or timeout the whole group is killed (a case may leave descendants
+/// behind), then the leader is reaped and the output collected.
 fn run_with_timeout(mut cmd: Command, timeout: Duration) -> (Option<i32>, String, String) {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
     let mut child = cmd.spawn().expect("spawn test subprocess");
+    let pid = child.id() as libc::pid_t;
     let mut so = child.stdout.take().unwrap();
     let mut se = child.stderr.take().unwrap();
     let to = std::thread::spawn(move || {
@@ -215,16 +222,32 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> (Option<i32>, String
         s
     });
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(st) = child.try_wait().expect("wait") {
-            break st;
+    loop {
+        // SAFETY: zeroed siginfo_t is a valid out-parameter.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waits for our own child without reaping it.
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if r == 0 && info.si_signo == libc::SIGCHLD {
+            break;
+        }
+        if r != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            break child.wait().expect("wait");
+            break;
         }
         std::thread::sleep(Duration::from_millis(20));
-    };
+    }
+    // SAFETY: the group of our unreaped child; its id cannot be reused yet.
+    unsafe { libc::kill(-pid, libc::SIGKILL) };
+    let status = child.wait().expect("wait");
     let out = to.join().unwrap();
     let mut err = te.join().unwrap();
     let code = status.code();
@@ -238,8 +261,44 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> (Option<i32>, String
 // ---------------------------------------------------------------------------
 // fork helpers
 
+/// Wait for `pid` at most `limit`: the exit status, or minus the signal.
+/// Past the deadline the child is killed and reaped. `EINTR` is retried.
+pub fn wait_bounded(pid: libc::pid_t, limit: Duration) -> i32 {
+    assert!(pid > 0, "no child to wait for");
+    let deadline = Instant::now() + limit;
+    let mut killed = false;
+    loop {
+        let mut status = 0;
+        // SAFETY: waiting for our own child.
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if r == pid {
+            if killed {
+                return -libc::SIGKILL;
+            }
+            return if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                -libc::WTERMSIG(status)
+            };
+        }
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            panic!("waitpid: {e}");
+        }
+        if !killed && Instant::now() >= deadline {
+            // SAFETY: our own child, not reaped yet.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            killed = true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Fork; run `child` in the child and `_exit` with its return value. Returns
-/// the child's exit status in the parent (or -signal).
+/// the child's exit status in the parent (or -signal), waiting at most 30 s.
 pub fn fork_and_wait(child: impl FnOnce() -> i32) -> i32 {
     // SAFETY: test helper; the child only runs `child` and then _exit.
     let pid = unsafe { libc::fork() };
@@ -254,15 +313,139 @@ pub fn fork_and_wait(child: impl FnOnce() -> i32) -> i32 {
         // destructors inherited from the parent.
         unsafe { libc::_exit(code) };
     }
-    let mut status = 0;
-    // SAFETY: waiting for our own child.
-    let r = unsafe { libc::waitpid(pid, &mut status, 0) };
-    assert_eq!(r, pid);
-    if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else {
-        -libc::WTERMSIG(status)
+    wait_bounded(pid, Duration::from_secs(30))
+}
+
+/// A child made with a raw `clone` system call (no atfork handlers run, and
+/// on older C libraries `getpid()` would return the parent's id there). The
+/// caller must have no other live thread: the child may allocate.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub fn raw_clone_and_wait(child: impl FnOnce() -> i32) -> i32 {
+    // SAFETY: a clone with only SIGCHLD: a copy of the address space, like
+    // fork without the C library's handlers.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_clone,
+            libc::SIGCHLD as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+        )
+    };
+    assert!(r >= 0, "clone: {}", std::io::Error::last_os_error());
+    if r == 0 {
+        // SAFETY: alarm has no preconditions.
+        unsafe { libc::alarm(20) };
+        let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(child)).unwrap_or(99);
+        // SAFETY: as in fork_and_wait.
+        unsafe { libc::_exit(code) };
     }
+    wait_bounded(r as libc::pid_t, Duration::from_secs(30))
+}
+
+/// True when the kernel clears a page marked `MADV_WIPEONFORK` in a child.
+pub fn kernel_wipes_on_fork() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        const MADV_WIPEONFORK: libc::c_int = 18;
+        // SAFETY: sysconf has no preconditions.
+        let len = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        // SAFETY: a new private anonymous mapping.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return false;
+        }
+        // SAFETY: `p` and `len` are the mapping just made.
+        let ok = unsafe {
+            libc::madvise(p, len, -1) != 0 && libc::madvise(p, len, MADV_WIPEONFORK) == 0
+        };
+        let wiped = ok && {
+            let cell = p as *mut u64;
+            // SAFETY: the page is mapped and writable.
+            unsafe { cell.write_volatile(1) };
+            // SAFETY: the child only reads the page.
+            let read = move || i32::from(unsafe { cell.read_volatile() } != 0);
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            let code = raw_clone_and_wait(read);
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            let code = fork_and_wait(read);
+            code == 0
+        };
+        // SAFETY: the mapping made above, no longer used.
+        unsafe { libc::munmap(p, len) };
+        wiped
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// `kernel_wipes_on_fork()`, failing the case when it is false and
+/// `RUST_DAOS_REQUIRE_WIPE=1`.
+pub fn require_wipe() -> bool {
+    let wipes = kernel_wipes_on_fork();
+    if !wipes && std::env::var("RUST_DAOS_REQUIRE_WIPE").as_deref() == Ok("1") {
+        panic!("RUST_DAOS_REQUIRE_WIPE=1 but the kernel does not clear the page in children");
+    }
+    wipes
+}
+
+/// Exit code of a process whose `unshare` failed (not `SKIP`: a case
+/// process that skips for another reason must not be read as this one).
+pub const NS_UNSHARE_FAILED: i32 = 76;
+/// Exit code of a process whose clone into a new PID namespace failed.
+pub const NS_CLONE_FAILED: i32 = 78;
+
+/// Report a namespace setup failure from a child: write the errno to `fd`
+/// and exit with `code`.
+pub fn ns_fail(fd: libc::c_int, code: i32) -> ! {
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    let bytes = errno.to_ne_bytes();
+    // SAFETY: writes four bytes from a local to our own pipe end.
+    unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+    // SAFETY: leave without running anything inherited.
+    unsafe { libc::_exit(code) }
+}
+
+/// A pipe for `ns_fail`: (read end, write end).
+pub fn ns_pipe() -> (libc::c_int, libc::c_int) {
+    let mut fds = [0; 2];
+    // SAFETY: an array of two descriptors as pipe expects.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    (fds[0], fds[1])
+}
+
+/// After the case's child exited with `code`: skip when it reported a
+/// namespace setup failure (`NS_UNSHARE_FAILED` or `NS_CLONE_FAILED`) through the pipe.
+pub fn ns_skip_on_failure(code: i32, read_fd: libc::c_int) {
+    if code != NS_UNSHARE_FAILED && code != NS_CLONE_FAILED {
+        return;
+    }
+    let mut bytes = [0u8; 4];
+    // SAFETY: reads at most four bytes into a local.
+    let n = unsafe { libc::read(read_fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+    let errno = if n == 4 {
+        i32::from_ne_bytes(bytes)
+    } else {
+        -1
+    };
+    skip(&format!(
+        "PID namespaces not available (exit {code}, errno {errno})"
+    ));
 }
 
 // ---------------------------------------------------------------------------

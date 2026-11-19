@@ -499,6 +499,140 @@ fn fork_child_is_refused_and_drop_is_silent() {
     assert_eq!(code, 0, "child checks failed");
 }
 
+/// A raw clone child (no atfork handler runs) of an initialised process is
+/// refused on every call.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn raw_clone_child_is_refused_after_init() {
+    init_mock(MockVariant::Full);
+    let dfs = Dfs::connect("pool", "cont").unwrap();
+    dfs.write("/rc/f", b"data").unwrap();
+    let file = dfs.open("/rc/f").unwrap();
+    let path = mock_lib(MockVariant::Full);
+    let code = raw_clone_and_wait(|| {
+        let forked = |r: Result<(), Error>| matches!(r, Err(Error::Forked { .. }));
+        let mut ok = true;
+        // SAFETY: the child is single-threaded; nothing else reads or writes
+        // the environment while init runs.
+        ok &= forked(unsafe { daos::init(&InitOptions::new().library_path(&path)) }.map(|_| ()));
+        ok &= forked(Dfs::connect("pool", "cont").map(|_| ()));
+        ok &= forked(file.size().map(|_| ()));
+        i32::from(!ok)
+    });
+    assert_eq!(code, 0, "child checks failed");
+    assert_eq!(file.size().unwrap(), 4);
+}
+
+/// A process that is PID 1 of its namespace has a child that is PID 1 of a
+/// new nested namespace: equal pids, and the child is still refused.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn fork_child_with_equal_pid_is_refused() {
+    if !require_wipe() {
+        skip("the kernel does not clear the page in children");
+    }
+    // Skips here, before any fork, when the C mock is not built.
+    let _ = mock_lib(MockVariant::Full);
+    let (read_fd, write_fd) = ns_pipe();
+    // A: before any crate use.
+    let code = fork_and_wait(move || {
+        // SAFETY: unshare in a single-threaded child.
+        if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWPID) } != 0 {
+            ns_fail(write_fd, NS_UNSHARE_FAILED);
+        }
+        // SAFETY: the single-threaded A forks B, PID 1 of the new namespace.
+        let b = unsafe { libc::fork() };
+        if b < 0 {
+            // Not a namespace limit: a failure of the case.
+            return 20;
+        }
+        if b == 0 {
+            // SAFETY: alarm has no preconditions.
+            unsafe { libc::alarm(20) };
+            let code = std::panic::catch_unwind(|| equal_pid_parent(write_fd)).unwrap_or(99);
+            // SAFETY: leave without running anything inherited.
+            unsafe { libc::_exit(code) };
+        }
+        wait_bounded(b, Duration::from_secs(15))
+    });
+    // Every other writer has exited: a read sees the record or end of file.
+    // SAFETY: our own descriptor, closed once.
+    unsafe { libc::close(write_fd) };
+    ns_skip_on_failure(code, read_fd);
+    assert_eq!(code, 0, "child checks failed");
+}
+
+/// B: PID 1 of its namespace. Initialises, then makes C, PID 1 of a nested
+/// namespace, with a raw clone.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn equal_pid_parent(write_fd: libc::c_int) -> i32 {
+    if std::process::id() != 1 {
+        return 10;
+    }
+    init_mock(MockVariant::Full);
+    let dfs = Dfs::connect("pool", "cont").unwrap();
+    dfs.write("/ns/f", b"data").unwrap();
+    let file = dfs.open("/ns/f").unwrap();
+    let path = mock_lib(MockVariant::Full);
+    // SAFETY: a clone into a new PID namespace with only SIGCHLD otherwise:
+    // a copy of the address space; B has no other thread.
+    let c = unsafe {
+        libc::syscall(
+            libc::SYS_clone,
+            (libc::CLONE_NEWPID | libc::SIGCHLD) as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+        )
+    };
+    if c < 0 {
+        ns_fail(write_fd, NS_CLONE_FAILED);
+    }
+    if c == 0 {
+        // C: PID 1 again.
+        let both_one = |r: Result<(), Error>| {
+            matches!(
+                r,
+                Err(Error::Forked {
+                    created_pid: 1,
+                    current_pid: 1,
+                    ..
+                })
+            )
+        };
+        let mut code = 0;
+        // SAFETY: getpid has no preconditions.
+        if unsafe { libc::syscall(libc::SYS_getpid) } != 1 {
+            code = 11;
+        } else if !both_one(
+            // SAFETY: C is single-threaded; nothing else reads or writes the
+            // environment while init runs.
+            unsafe { daos::init(&InitOptions::new().library_path(&path)) }.map(|_| ()),
+        ) {
+            code = 12;
+        } else if !both_one(Dfs::connect("pool", "cont").map(|_| ())) {
+            code = 13;
+        } else if !both_one(file.size().map(|_| ())) {
+            code = 14;
+        }
+        // SAFETY: leave without running anything inherited.
+        unsafe { libc::_exit(code) };
+    }
+    let code = wait_bounded(c as libc::pid_t, Duration::from_secs(10));
+    if code == 0 && file.size().unwrap() != 4 {
+        return 15;
+    }
+    code
+}
+
 fn fork_child_does_not_hang_on_parent_locks() {
     init_mock(MockVariant::Full);
     let ctl = MockCtl::open(MockVariant::Full);
@@ -1013,5 +1147,20 @@ fn main() {
         ),
         case("threads_on_one_file", threads_on_one_file),
     ];
+    let mut cases = Vec::from(cases);
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    cases.extend([
+        case(
+            "raw_clone_child_is_refused_after_init",
+            raw_clone_child_is_refused_after_init,
+        ),
+        case(
+            "fork_child_with_equal_pid_is_refused",
+            fork_child_with_equal_pid_is_refused,
+        ),
+    ]);
     run_main(&cases, prepare_mocks);
 }

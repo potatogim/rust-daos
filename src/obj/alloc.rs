@@ -14,9 +14,14 @@ use crate::error::{Error, Result};
 /// from `daos_cont_alloc_oids` in batches, and
 /// [`Container::generate_oid`] encodes type and class.
 ///
-/// The range of the current batch lives in this process. A fork child
-/// cannot use it (every call there returns [`Error::Forked`]), so a parent
-/// and a child never draw from one range. Ids drawn and not used are lost.
+/// The range of the current batch lives in this process. A child that the
+/// crate recognises as such cannot use it ([`next`](Self::next) returns
+/// [`Error::Forked`] there), so a parent and such a child never draw from
+/// one range. Where the kernel cannot clear the crate's token page in
+/// children, a descendant with the parent's process id (possible with PID
+/// namespaces) is recognised only when a `fork` of the C library lies
+/// between, after the crate's atfork handler was installed; see the README
+/// section Processes. Ids drawn and not used are lost.
 pub struct OidAllocator {
     cont: Container,
     /// (next, end) of the current range.
