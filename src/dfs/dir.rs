@@ -10,7 +10,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
-use super::{DirHandle, Mount};
+use super::{DirHandle, MountRef};
 use crate::error::{Error, Result};
 use crate::path;
 use crate::sys::{daos_anchor_t, dfs_obj_t, dfs_t, DFS_MAX_NAME};
@@ -88,6 +88,9 @@ unsafe extern "C" fn filler(
 /// [`Dfs::metadata`](crate::Dfs::metadata) call per entry. After an error the
 /// iterator ends.
 ///
+/// After a close of the mount, `next` may still return names it had already
+/// read; the next read from DFS returns [`Error::Closed`](crate::Error::Closed).
+///
 /// In a fork child `next` returns [`Error::Forked`](crate::Error::Forked)
 /// once, also when names were buffered, and then `None`. An iterator that
 /// had already ended with an error before the fork returns `None`. These
@@ -99,7 +102,7 @@ unsafe extern "C" fn filler(
 /// that memory allocated. Directories get replicated classes by default;
 /// iterate directories of an erasure-code class to the end.
 pub struct ReadDir {
-    mount: Arc<Mount>,
+    mount: Arc<MountRef>,
     dir: Arc<DirHandle>,
     path: Arc<str>,
     anchor: Box<daos_anchor_t>,
@@ -119,7 +122,7 @@ impl fmt::Debug for ReadDir {
 }
 
 impl ReadDir {
-    pub(crate) fn new(mount: Arc<Mount>, dir: Arc<DirHandle>, path: String) -> ReadDir {
+    pub(crate) fn new(mount: Arc<MountRef>, dir: Arc<DirHandle>, path: String) -> ReadDir {
         ReadDir {
             mount,
             dir,

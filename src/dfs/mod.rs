@@ -3,6 +3,18 @@
 
 //! DFS mounts: [`Dfs`], the mount on a crate-owned container connection, the
 //! open handle table and the directory handle cache.
+//!
+//! A mount is shared between its users and its container connection. The
+//! users ([`Dfs`], [`File`], [`ReadDir`], a directory handle while it
+//! releases its object) hold a [`MountRef`]; the registry holds it weakly.
+//! The container connection lists the [`Mount`] itself, and the mount holds
+//! a lease of the connection until its `dfs_umount` succeeds. The drop of the last
+//! `MountRef` unmounts, unless a close got there first.
+//!
+//! The states of a mount, the rule that every call of a mount comes from a
+//! thread that holds a user (with the two teardowns as the exceptions), the
+//! rule on the last container lease and the lock order are described in
+//! `crate::conn`.
 
 mod dir;
 mod file;
@@ -14,17 +26,18 @@ pub use file::{File, OpenOptions};
 pub use metadata::{FileType, Metadata};
 pub use writer::Writer;
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use crate::conn::{Access, ContConn, Key, Registry};
+use crate::conn::{state, Access, ContConn, Key, Registry};
 use crate::error::{Error, Result};
 use crate::fork::Stamp;
-use crate::gate::{Gate, Pass};
+use crate::gate::{Check, Deadline, Final, Gate, Pass};
 use crate::path;
 use crate::sys::api::Raw;
 use crate::sys::{self, dfs_obj_t, dfs_t};
@@ -151,7 +164,8 @@ impl Op<'_> {
 /// A cached directory handle (from `dfs_lookup`). Released when the last
 /// reference drops, so a call never sees a freed pointer.
 pub(crate) struct DirHandle {
-    mount: Weak<Mount>,
+    /// The users' handle of the mount, not the mount itself.
+    mount: Weak<MountRef>,
     pub(crate) obj: ObjPtr,
     slot: u64,
     stamp: Stamp,
@@ -162,24 +176,124 @@ impl Drop for DirHandle {
         if self.stamp.is_foreign() {
             return; // fork child: leak, never touch locks or libdfs
         }
+        // The upgraded handle makes this release a user of the mount until
+        // `release_slot` has returned, so no teardown runs under it. When
+        // the upgrade fails, the teardown releases this slot with the
+        // others.
         if let Some(m) = self.mount.upgrade() {
-            let _ = m.release_slot(self.slot);
+            m.release_dir_slot(self.slot);
+            drop(m);
         }
-        // Mount already gone: its own drop released every slot.
     }
 }
 
 // ---------------------------------------------------------------------------
 // Mount
 
-/// One `dfs_t` (from `dfs_mount`) and everything attached to it.
+/// What the users of a mount hold: [`Dfs`], [`File`], [`ReadDir`], a
+/// directory handle while it releases its object, and the registry (weak).
+/// Its drop means that the last user is gone, and it unmounts.
+pub(crate) struct MountRef {
+    core: Arc<Mount>,
+}
+
+impl MountRef {
+    /// The mount itself.
+    #[cfg(all(test, feature = "mock"))]
+    pub(crate) fn core(&self) -> Arc<Mount> {
+        Arc::clone(&self.core)
+    }
+}
+
+impl std::ops::Deref for MountRef {
+    type Target = Mount;
+
+    fn deref(&self) -> &Mount {
+        &self.core
+    }
+}
+
+#[cfg(all(test, feature = "mock"))]
+pub(crate) static VIEW_DROPS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+impl Drop for MountRef {
+    fn drop(&mut self) {
+        #[cfg(all(test, feature = "mock"))]
+        VIEW_DROPS.fetch_add(1, Ordering::SeqCst);
+        // Before any lock: this may be a fork child.
+        match self.core.stamp.check_cold() {
+            Ok(()) => {}
+            Err(Error::Forked {
+                created_pid,
+                current_pid: 0,
+            }) => {
+                // The owner cannot be confirmed: leave the mount as it is,
+                // listed with its lease, and record why.
+                #[cfg(all(test, feature = "mock"))]
+                crate::gate::testing::run("ViewDropBeforeOrphan", 0, &());
+                self.core.orphan(created_pid);
+                return;
+            }
+            // Fork child: leak everything. Tearing down could send messages
+            // on connections the parent still uses.
+            Err(_) => return,
+        }
+        #[cfg(all(test, feature = "mock"))]
+        crate::gate::testing::run("ViewDropBeforeUnmount", 0, &());
+        if self.core.begin_unmount() {
+            let _ = self.core.teardown();
+            drop(self.core.take_dir_cache());
+        }
+    }
+}
+
+/// What a close of a mount did.
+pub(crate) enum Unmount {
+    /// The process check failed. This call touched nothing.
+    Refused(Error),
+    /// The mount gate could not be taken by the deadline (calls of the
+    /// mount, or another close of it, held it). This call touched nothing.
+    Busy(Error),
+    /// Closed before, or another thread is closing it. Nothing was done
+    /// here.
+    Elsewhere,
+    /// This call ran the teardown; its result.
+    Done(Result<()>),
+}
+
+/// While it lives, new calls of the mount are refused with `Closed`, as
+/// they are while a close of the mount waits. Owns the mount; raises the
+/// gate's count of waiting closes by one when made and lowers it by one
+/// when dropped. Takes no lock.
+pub(crate) struct CloseHold(Arc<Mount>);
+
+impl CloseHold {
+    fn new(m: &Arc<Mount>) -> CloseHold {
+        let m = Arc::clone(m);
+        m.gate.raise_closers();
+        CloseHold(m)
+    }
+}
+
+impl Drop for CloseHold {
+    fn drop(&mut self) {
+        self.0.gate.lower_closers();
+    }
+}
+
+/// One `dfs_t` (from `dfs_mount`) and everything attached to it, shared
+/// between its [`MountRef`] and the mount list of its container.
 ///
 /// Close and handle synchronisation: every operation that passes the `dfs_t`
 /// or a `dfs_obj_t` to libdfs holds the gate shared and checks the closed
-/// flag. [`Mount::close`] takes the gate exclusively, marks the mount
-/// closed, releases every pointer in the handle table, unmounts, and gives
-/// up the mount's container lease. A handle never passes its pointer without
-/// holding the gate, so no call can run on a freed object.
+/// flag, and its thread holds a [`MountRef`]. An explicit close takes the
+/// gate exclusively and wins the exchange of `state` from mounted to
+/// unmounting before it marks the gate closed; the drop of the last
+/// `MountRef` wins the same exchange with no gate. The one winner releases
+/// every pointer in the handle table, unmounts, and publishes the end in
+/// `state`. A handle never passes its pointer without holding the gate, so
+/// no call can run on a freed object.
 pub(crate) struct Mount {
     pub(crate) backend: Arc<dyn Raw>,
     raw: DfsPtr,
@@ -188,22 +302,28 @@ pub(crate) struct Mount {
     sys_name: Option<String>,
     read_only: bool,
     pub(crate) stamp: Stamp,
-    self_ref: Weak<Mount>,
     gate: Gate,
     handles: Mutex<HashMap<u64, ObjPtr>>,
     next_slot: AtomicU64,
     dir_cache: Mutex<HashMap<String, Arc<DirHandle>>>,
     dir_cache_capacity: usize,
-    unmounted: AtomicBool,
-    /// errno of a failed `dfs_umount` (0: none).
-    umount_errno: AtomicI32,
-    /// The container lease; taken by the teardown.
+    /// Where the mount stands: mounted, being unmounted, unmounted, or left
+    /// mounted for good (see `crate::conn::state`). One atomic value,
+    /// readable without a lock.
+    state: AtomicU64,
+    /// The users' handle, for directory handles made by this mount.
+    view: Weak<MountRef>,
+    /// The container lease. Taken out after `dfs_umount` returned 0, kept
+    /// otherwise.
     cont: Mutex<Option<Arc<ContConn>>>,
+    /// The connection this mount was made on, compared by address only and
+    /// never upgraded: a check that takes no lock.
+    made_on: Weak<ContConn>,
 }
 
 impl Mount {
     /// Enter an operation: hold the gate shared and check the closed flag.
-    /// While a `close` waits for the gate, new operations get `Closed`.
+    /// While a close waits for the gate, new operations get `Closed`.
     pub(crate) fn enter(&self) -> Result<Op<'_>> {
         Ok(Op {
             mount: self,
@@ -229,26 +349,15 @@ impl Mount {
         Ok(!self.gate.is_closed())
     }
 
-    /// True while the `dfs_t` is mounted: before the teardown, and after a
-    /// teardown whose `dfs_umount` failed (the mount then keeps its
-    /// container lease).
-    pub(crate) fn is_mounted(&self) -> bool {
-        self.cont
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some()
+    /// The packed state (see `crate::conn::state`).
+    pub(crate) fn state(&self) -> u64 {
+        self.state.load(Ordering::SeqCst)
     }
 
-    /// The error of the failed `dfs_umount` (see [`Mount::is_mounted`]).
-    pub(crate) fn umount_error(&self) -> Error {
-        Error::Dfs {
-            op: "dfs_umount",
-            errno: match self.umount_errno.load(Ordering::SeqCst) {
-                0 => libc::EBUSY,
-                e => e,
-            },
-            path: Some(format!("{}/{}", self.pool, self.container)),
-        }
+    /// The mount gate.
+    #[cfg(all(test, feature = "mock"))]
+    pub(crate) fn gate(&self) -> &Gate {
+        &self.gate
     }
 
     /// Register an open object pointer; returns its slot.
@@ -262,7 +371,9 @@ impl Mount {
     }
 
     /// Release the object in `slot` (dfs_release) if the mount is still open
-    /// and the slot still exists. After close the slot is gone: nothing to do.
+    /// and the slot still exists. While a close holds the mount gate this
+    /// waits for it, so the call returns only after that close released the
+    /// slot. After close the slot is gone: nothing to do.
     pub(crate) fn release_slot(&self, slot: u64) -> Result<()> {
         // Releasing is allowed while a close waits.
         let _pass = match self.gate.enter(true) {
@@ -290,17 +401,58 @@ impl Mount {
         Ok(())
     }
 
-    /// Release every tracked object, unmount, and give up the container
+    /// [`Mount::release_slot`] for a dropped directory handle, which reports
+    /// nothing and so need not wait for a close: once the mount is closed for
+    /// good, the teardown releases every slot. Read before the gate, which
+    /// another close may hold exclusively, also while the caller holds a
+    /// container gate.
+    fn release_dir_slot(&self, slot: u64) {
+        if self.gate.is_closed() {
+            return;
+        }
+        let _ = self.release_slot(slot);
+    }
+
+    /// Exchange mounted for unmounting. The one caller that gets true runs
+    /// the teardown.
+    fn begin_unmount(&self) -> bool {
+        self.state
+            .compare_exchange(
+                state::pack(state::MOUNTED, 0),
+                state::pack(state::UNMOUNTING, 0),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// Exchange mounted for orphaned with the recorded process id; any other
+    /// state is kept.
+    fn orphan(&self, pid: u32) {
+        let _ = self.state.compare_exchange(
+            state::pack(state::MOUNTED, 0),
+            state::pack(state::ORPHANED, pid),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    fn take_dir_cache(&self) -> HashMap<String, Arc<DirHandle>> {
+        std::mem::take(&mut *self.dir_cache.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Release every tracked object, unmount, and, when `dfs_umount`
+    /// succeeded, take the mount out of the list and give up the container
     /// lease (which closes the container, and then the pool, when it was the
-    /// last lease). Caller holds the gate exclusively or is the last owner.
+    /// last lease). Run only by the thread whose [`Mount::begin_unmount`]
+    /// returned true: no call of the mount runs or can start then.
     ///
     /// A `dfs_release` that fails leaves its object allocated inside libdfs
     /// (`obj.c`: the object is freed only on success); the crate forgets the
     /// pointer anyway and reports the first error, so such an object leaks.
+    /// A failed `dfs_umount` is never tried again: the mount stays listed
+    /// with its lease.
     fn teardown(&self) -> Result<()> {
-        if self.unmounted.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
         let objs: Vec<ObjPtr> = self
             .handles
             .lock()
@@ -310,7 +462,8 @@ impl Mount {
             .collect();
         let mut first_err = None;
         for obj in objs {
-            // SAFETY: exclusive access (see above); each pointer is released once.
+            // SAFETY: the one teardown (see above); each pointer was taken
+            // out of the table, so it is released once.
             let rc = unsafe { self.backend.dfs_release(obj.0) };
             if rc != 0 && first_err.is_none() {
                 first_err = Some(Error::Dfs {
@@ -321,22 +474,34 @@ impl Mount {
             }
         }
         // SAFETY: every object of this mount was released above; the dfs_t is
-        // unmounted exactly once (guarded by `unmounted`).
+        // unmounted at most once (the exchange to unmounting has one winner,
+        // and a failed unmount is never tried again).
         let rc = unsafe { self.backend.dfs_umount(self.raw.0) };
         if rc != 0 {
-            self.umount_errno.store(rc, Ordering::SeqCst);
-            // The dfs_t may still use the container handle: keep the lease.
-            // It goes with the Mount, and libdaos refuses that container
-            // close while objects of the container are open.
-            return Err(Error::Dfs {
-                op: "dfs_umount",
-                errno: rc,
-                path: Some(format!("{}/{}", self.pool, self.container)),
-            });
+            // The dfs_t may still use the container handle: the lease and
+            // the list entry stay.
+            self.state
+                .store(state::pack(state::FAILED, rc as u32), Ordering::SeqCst);
+            #[cfg(all(test, feature = "mock"))]
+            crate::gate::testing::run("AfterFailedStore", 0, &());
+            return Err(crate::conn::umount_error(
+                &format!("{}/{}", self.pool, self.container),
+                rc,
+            ));
         }
-        let cont = self.cont.lock().unwrap_or_else(|e| e.into_inner()).take();
-        let released = match cont {
-            Some(c) => ContConn::release(c),
+        self.state
+            .store(state::pack(state::UNMOUNTED, 0), Ordering::SeqCst);
+        #[cfg(all(test, feature = "mock"))]
+        crate::gate::testing::run("AfterUnmountedStore", 0, &());
+        let lease = self.cont.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let released = match lease {
+            Some(lease) => {
+                let removed = remove_listed(&lease, self);
+                // Outside the list lock.
+                drop(removed);
+                // The only reference this call held.
+                ContConn::release(lease)
+            }
             None => Ok(()),
         };
         match first_err {
@@ -345,22 +510,79 @@ impl Mount {
         }
     }
 
-    pub(crate) fn close(&self, timeout: Duration) -> Result<()> {
-        self.stamp.check_cold()?;
-        let done = self.gate.close(timeout, || {
-            let cached: HashMap<String, Arc<DirHandle>> =
-                std::mem::take(&mut *self.dir_cache.lock().unwrap_or_else(|e| e.into_inner()));
-            (self.teardown(), cached)
-        })?;
-        match done {
-            None => Ok(()),
-            Some((result, cached)) => {
+    /// Close this mount, waiting for its calls until `deadline`.
+    pub(crate) fn close_by(&self, deadline: Deadline) -> Unmount {
+        // Before any lock: this may be a fork child.
+        if let Err(e) = self.stamp.check_cold() {
+            return Unmount::Refused(e);
+        }
+        self.close_checked(deadline)
+    }
+
+    /// [`Mount::close_by`] after its process check.
+    fn close_checked(&self, deadline: Deadline) -> Unmount {
+        let won = Cell::new(false);
+        let r = self.gate.close_by(
+            deadline,
+            || None,
+            |_| {
+                // Before the gate reads closed: a container close that sees
+                // the closed gate also sees the mount leave the mounted
+                // state.
+                won.set(self.begin_unmount());
+                Check::Ready
+            },
+            |last, _| Final::Error(last.reason()),
+            || {
+                #[cfg(all(test, feature = "mock"))]
+                crate::gate::testing::run("MountGateClosed", 0, &());
+                won.get().then(|| (self.teardown(), self.take_dir_cache()))
+            },
+        );
+        match r {
+            Err(e) => Unmount::Busy(e),
+            Ok(None) | Ok(Some(None)) => Unmount::Elsewhere,
+            Ok(Some(Some((result, cached)))) => {
+                #[cfg(all(test, feature = "mock"))]
+                crate::gate::testing::run("BeforeCachedDrop", 0, &());
                 // Dropped after the gate is released: their slots are gone
-                // already.
+                // already, and their release enters no gate.
                 drop(cached);
-                result
+                Unmount::Done(result)
             }
         }
+    }
+
+    /// `Dfs::close`: waits for calls of the mount up to `timeout`.
+    pub(crate) fn close(&self, timeout: Duration) -> Result<()> {
+        let deadline = Deadline::after(timeout);
+        #[cfg(all(test, feature = "mock"))]
+        crate::gate::testing::note(crate::gate::testing::Note::Made("mount", deadline.id));
+        match self.close_by(deadline) {
+            Unmount::Refused(e) | Unmount::Busy(e) => Err(e),
+            Unmount::Elsewhere => Ok(()),
+            Unmount::Done(r) => r,
+        }
+    }
+
+    /// For the container close: one try of the mount gate, no sleep. When
+    /// the process check has passed and `hold` is given and empty, a
+    /// [`CloseHold`] of this mount is put into it before the gate is tried.
+    pub(crate) fn close_now(this: &Arc<Mount>, hold: Option<&mut Option<CloseHold>>) -> Unmount {
+        #[cfg(all(test, feature = "mock"))]
+        crate::fork::testing::fault_point("mount_close");
+        if let Err(e) = this.stamp.check_cold() {
+            return Unmount::Refused(e);
+        }
+        if let Some(h) = hold {
+            if h.is_none() {
+                *h = Some(CloseHold::new(this));
+            }
+        }
+        let deadline = Deadline::passed();
+        #[cfg(all(test, feature = "mock"))]
+        crate::gate::testing::note(crate::gate::testing::Note::Handed(deadline.id));
+        this.close_checked(deadline)
     }
 
     fn access(&self) -> Access {
@@ -413,7 +635,7 @@ impl Mount {
         }
         let slot = self.track(ObjPtr(obj));
         let handle = Arc::new(DirHandle {
-            mount: self.self_ref.clone(),
+            mount: self.view.clone(),
             obj: ObjPtr(obj),
             slot,
             stamp: self.stamp,
@@ -440,16 +662,19 @@ impl Mount {
         }
         let h = self.lookup_dir(op, dir)?;
         if self.dir_cache_capacity > 0 {
-            let evicted = {
+            // Every handle that leaves the cache is dropped after the cache
+            // lock is released: its drop may release its object.
+            let (evicted, replaced) = {
                 let mut cache = self.dir_cache.lock().unwrap_or_else(|e| e.into_inner());
                 let evicted = if cache.len() >= self.dir_cache_capacity {
                     std::mem::take(&mut *cache)
                 } else {
                     HashMap::new()
                 };
-                cache.insert(dir.to_string(), h.clone());
-                evicted
+                let replaced = cache.insert(dir.to_string(), h.clone());
+                (evicted, replaced)
             };
+            drop(replaced);
             drop(evicted);
         }
         Ok((h, false))
@@ -547,19 +772,14 @@ impl Mount {
     }
 }
 
-impl Drop for Mount {
-    fn drop(&mut self) {
-        if self.stamp.is_foreign() {
-            // Fork child: leak everything. Tearing down could send messages on
-            // connections the parent still uses.
-            return;
-        }
-        if !self.gate.is_closed_mut() {
-            let _ = self.teardown();
-        }
-        // DirHandles in the cache drop after this; their Weak<Mount> no
-        // longer upgrades and their slots were released above.
-    }
+/// Take `mount` out of the list of `cont`, keeping the order of the others,
+/// and raise the list generation in the same hold of the list lock. Returns
+/// the entry, for the caller to drop after the lock is released.
+pub(crate) fn remove_listed(cont: &ContConn, mount: &Mount) -> Option<Arc<Mount>> {
+    let mut list = cont.mounts.lock().unwrap_or_else(|e| e.into_inner());
+    let i = list.iter().position(|m| std::ptr::eq(&**m, mount));
+    cont.mounts_gen.fetch_add(1, Ordering::SeqCst);
+    i.map(|i| list.remove(i))
 }
 
 pub(crate) fn cstring(s: &str) -> Result<CString> {
@@ -641,7 +861,7 @@ pub(crate) fn mount(
     registry: &Registry,
     backend: Arc<dyn Raw>,
     opts: &ConnectOptions,
-) -> Result<Arc<Mount>> {
+) -> Result<Arc<MountRef>> {
     opts.validate()?;
     let sys = opts.sys_name.as_deref();
     let access = if opts.read_only {
@@ -651,14 +871,14 @@ pub(crate) fn mount(
     };
     let sys_key = crate::conn::system_key(sys);
     // Check the system rule before any connection is opened.
-    registry.acquire::<Mount>(
+    registry.acquire::<MountRef>(
         Key::Mount(opts.pool.clone(), opts.container.clone(), access),
         &sys_key,
         |r| {
             let key = (opts.pool.clone(), opts.container.clone(), access);
             r.mounts.get(&key).and_then(Weak::upgrade)
         },
-        Mount::live,
+        |m| m.live(),
         || {
             let attempt = || {
                 let cont =
@@ -682,15 +902,26 @@ pub(crate) fn mount_on(
     cont: &Arc<ContConn>,
     sys_name: Option<String>,
     options: &MountOptions,
-) -> Result<Arc<Mount>> {
+) -> Result<Arc<MountRef>> {
     let registry = cont.backend.registry();
     let sys_key = crate::conn::system_key(sys_name.as_deref());
     let key = (cont.pool_name.clone(), cont.name.clone(), cont.access);
-    registry.acquire::<Mount>(
+    registry.acquire::<MountRef>(
         Key::Mount(key.0.clone(), key.1.clone(), key.2),
         &sys_key,
         |r| r.mounts.get(&key).and_then(Weak::upgrade),
-        Mount::live,
+        |m| {
+            if !m.live()? {
+                return Ok(false);
+            }
+            // A live mount of another connection under the same key: this
+            // connection is closing or closed, since a usable one would be
+            // the registry's entry.
+            if !std::ptr::eq(m.made_on.as_ptr(), Arc::as_ptr(cont)) {
+                return Err(Error::Closed);
+            }
+            Ok(true)
+        },
         || {
             if !cont.usable()? {
                 return Err(Error::Closed);
@@ -707,7 +938,7 @@ pub(crate) fn mount_on(
     )
 }
 
-fn store_mount(r: &mut crate::conn::RegistryInner, m: &Arc<Mount>) {
+fn store_mount(r: &mut crate::conn::RegistryInner, m: &Arc<MountRef>) {
     r.mounts.retain(|_, w| w.strong_count() > 0);
     r.mounts.insert(
         (m.pool.clone(), m.container.clone(), m.access()),
@@ -715,12 +946,15 @@ fn store_mount(r: &mut crate::conn::RegistryInner, m: &Arc<Mount>) {
     );
 }
 
+/// A new mount on `cont`, listed on the connection before the container
+/// pass is released, so a container close that waits for that pass finds
+/// it.
 fn new_mount(
     cont: Arc<ContConn>,
     sys_name: Option<String>,
     dir_cache_capacity: usize,
     stamp: Stamp,
-) -> Result<Arc<Mount>> {
+) -> Result<Arc<MountRef>> {
     let access = cont.access;
     let pass = match cont.enter() {
         // A container close is waiting: wait for its outcome. After a
@@ -732,29 +966,36 @@ fn new_mount(
         }
         r => r?,
     };
+    // A connection that can never be closed gets no new mount. Checked once:
+    // the retries of `dfs_mount` belong to this one attempt.
+    if let Some(e) = cont.standing_error() {
+        return Err(e);
+    }
     let raw = mount_raw(&cont, access).map_err(|rc| Error::dfs("dfs_mount", rc, cont.target()))?;
-    let m = Arc::new_cyclic(|me| Mount {
-        backend: cont.backend.clone(),
-        raw: DfsPtr(raw),
-        pool: cont.pool_name.clone(),
-        container: cont.name.clone(),
-        sys_name,
-        read_only: access == Access::ReadOnly,
-        stamp,
-        self_ref: me.clone(),
-        gate: Gate::new(),
-        handles: Mutex::new(HashMap::new()),
-        next_slot: AtomicU64::new(1),
-        dir_cache: Mutex::new(HashMap::new()),
-        dir_cache_capacity,
-        unmounted: AtomicBool::new(false),
-        umount_errno: AtomicI32::new(0),
-        cont: Mutex::new(Some(cont.clone())),
+    let m = Arc::new_cyclic(|view| MountRef {
+        core: Arc::new(Mount {
+            backend: cont.backend.clone(),
+            raw: DfsPtr(raw),
+            pool: cont.pool_name.clone(),
+            container: cont.name.clone(),
+            sys_name,
+            read_only: access == Access::ReadOnly,
+            stamp,
+            gate: Gate::new(),
+            handles: Mutex::new(HashMap::new()),
+            next_slot: AtomicU64::new(1),
+            dir_cache: Mutex::new(HashMap::new()),
+            dir_cache_capacity,
+            state: AtomicU64::new(state::pack(state::MOUNTED, 0)),
+            view: view.clone(),
+            cont: Mutex::new(Some(cont.clone())),
+            made_on: Arc::downgrade(&cont),
+        }),
     });
     {
-        let mut mounts = cont.mounts.lock().unwrap_or_else(|e| e.into_inner());
-        mounts.retain(|w| w.strong_count() > 0);
-        mounts.push(Arc::downgrade(&m));
+        let mut list = cont.mounts.lock().unwrap_or_else(|e| e.into_inner());
+        list.push(Arc::clone(&m.core));
+        cont.mounts_gen.fetch_add(1, Ordering::SeqCst);
     }
     // Released only now: a container close waits for this pass, so it
     // finds the mount in its list.
@@ -787,7 +1028,7 @@ fn new_mount(
 /// ```
 #[derive(Clone)]
 pub struct Dfs {
-    pub(crate) mount: Arc<Mount>,
+    pub(crate) mount: Arc<MountRef>,
 }
 
 impl fmt::Debug for Dfs {
@@ -836,6 +1077,13 @@ impl Dfs {
     /// A live mount keeps referring to the container it opened, even when
     /// another process renames it or destroys it and creates a new one under
     /// the same label.
+    ///
+    /// The live mount of the key is returned if there is one. Else, when the
+    /// container connection is kept open for good (see
+    /// [`Container::close`](crate::Container::close)), the error that keeps
+    /// it open is returned and no mount is made. That check is made once,
+    /// before `dfs_mount`; its retries on `ENOENT` are part of the same
+    /// attempt.
     pub fn connect_with(options: &ConnectOptions) -> Result<Dfs> {
         let rt = crate::runtime::runtime()?;
         let mount = mount(rt.backend.registry(), rt.backend.clone(), options)?;
@@ -1217,14 +1465,28 @@ impl Dfs {
     /// every open handle of this mount (also those held by [`File`],
     /// [`Writer`] and [`ReadDir`] values), `dfs_umount`, and give up the
     /// mount's container connection: when nothing else uses it, the
-    /// container is closed and then the pool disconnected. Idempotent.
+    /// container is closed and then the pool disconnected. Idempotent: this
+    /// returns `Ok` when the mount is closed already, or when its unmount was
+    /// started elsewhere by the time this call takes the mount gate.
     ///
     /// Affects every clone of this `Dfs`. Later operations on old handles
-    /// return [`Error::Closed`]; a later [`Dfs::connect`] creates a new mount.
-    /// DAOS itself stays initialised.
+    /// return [`Error::Closed`] (a [`ReadDir`] may first return names it had
+    /// already read); a later [`Dfs::connect`] creates a new mount. DAOS
+    /// itself stays initialised.
     ///
-    /// [`Error::Busy`] when operations still run after `timeout`; the mount is
-    /// then left connected and accepts operations again.
+    /// [`Error::Busy`] when operations still run after `timeout`, or when
+    /// another close of the mount (also a container close) still holds the
+    /// mount gate at the deadline, while it waits or while it unmounts; this
+    /// call then released and unmounted nothing. When that other close was
+    /// unmounting, the mount is closed already and this call still returns
+    /// `Busy`. Otherwise this call leaves the mount connected; new calls are
+    /// accepted again only if the mount is still open after the last
+    /// waiting close of it has returned.
+    ///
+    /// A failed `dfs_umount` is never tried again: the mount is then closed
+    /// for its users and its files are released, but the container
+    /// connection stays open for the rest of the process and makes no new
+    /// mount (see [`Container::close`](crate::Container::close)).
     ///
     /// On an inherited handle `close` returns [`Error::Forked`] before any
     /// DAOS call when the process check at entry fails. It also returns that
@@ -1262,11 +1524,10 @@ fn is_dfs(e: &Error) -> bool {
 // Send/Sync decisions (crate docs, "Threads").
 const _: () = {
     const fn send_sync<T: Send + Sync>() {}
-    const fn send<T: Send>() {}
     send_sync::<Dfs>();
     send_sync::<File>();
-    send::<Writer>();
-    send::<ReadDir>();
+    send_sync::<Writer>();
+    send_sync::<ReadDir>();
 };
 
 #[cfg(all(test, feature = "mock"))]
@@ -1349,5 +1610,423 @@ mod tests {
         assert!(Arc::ptr_eq(&r.unwrap().unwrap(), &m1));
         assert_eq!(mem.calls("dfs_mount"), 1);
         assert_eq!(n, 1);
+    }
+}
+
+/// Unmounts, directory handles and new mounts on a connection.
+#[cfg(all(test, feature = "mock"))]
+mod mount_tests {
+    use super::*;
+    use crate::conn::support::*;
+    use crate::cont::{Container, ContainerOptions};
+    use crate::fork::testing::{rerun_alone, with_pid_fault_at};
+    use crate::gate::testing;
+    use crate::mock::MemDfs;
+    use crate::tx::TxMode;
+    use std::cell::RefCell;
+
+    const T1: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn directory_release_holds_off_the_unmount() {
+        testing::clear();
+        let mem = Arc::new(MemDfs::new());
+        let options = ConnectOptions::new("mock", "mock").dir_cache_capacity(0);
+        let dfs = Dfs::connect_mock_with(mem.clone(), &options).unwrap();
+        dfs.create_dir("/d").unwrap();
+        let rd = dfs.read_dir("/d").unwrap();
+        let pause = mem.pause_next("dfs_release");
+        let a = std::thread::spawn(move || drop(rd));
+        assert!(pause.wait_entered(LIMIT));
+        std::thread::spawn(move || drop(dfs)).join().unwrap();
+        assert_eq!(mem.calls("dfs_umount"), 0);
+        assert_eq!(mem.calls("daos_cont_close"), 0);
+        pause.release();
+        a.join().unwrap();
+        assert_eq!(mem.calls("dfs_umount"), 1);
+        assert_eq!(mem.calls("daos_cont_close"), 1);
+        assert_eq!(mem.open_objects(), 0);
+    }
+
+    #[test]
+    fn replaced_cache_entry_is_dropped_outside_the_cache_lock() {
+        testing::clear();
+        let mem = Arc::new(MemDfs::new());
+        let dfs = Dfs::connect_mock(mem.clone()).unwrap();
+        dfs.create_dir("/z").unwrap();
+        dfs.create_dir("/d").unwrap();
+        // Caches /z.
+        assert!(!dfs.exists("/z/x").unwrap());
+        let first = mem.pause_also("dfs_lookup");
+        let second = mem.pause_also("dfs_lookup");
+        let look = |dfs: &Dfs| {
+            let dfs = dfs.clone();
+            std::thread::spawn(move || dfs.exists("/d/x").unwrap())
+        };
+        let t1 = look(&dfs);
+        let t2 = look(&dfs);
+        assert!(first.wait_entered(LIMIT));
+        assert!(second.wait_entered(LIMIT));
+        // Both missed the cache. The first inserts and its caller drops
+        // its handle.
+        let (inserter, replacer, t_ins, t_rep) = if first.thread() == Some(t1.thread().id()) {
+            (first, second, t1, t2)
+        } else {
+            (first, second, t2, t1)
+        };
+        inserter.release();
+        assert!(!t_ins.join().unwrap());
+        // The second replaces it; the release of the replaced handle stops
+        // inside dfs_release.
+        let release = mem.pause_next("dfs_release");
+        replacer.release();
+        assert!(release.wait_entered(LIMIT));
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let d = dfs.clone();
+        let other = std::thread::spawn(move || done_tx.send(d.exists("/z/x").unwrap()).unwrap());
+        let found = done_rx
+            .recv_timeout(LIMIT)
+            .expect("the cache lock was held");
+        assert!(!found);
+        other.join().unwrap();
+        release.release();
+        assert!(!t_rep.join().unwrap());
+    }
+
+    #[test]
+    fn winner_alone_removes_its_list_entry() {
+        if rerun_alone("dfs::mount_tests::winner_alone_removes_its_list_entry") {
+            return;
+        }
+        // The container close of a mount whose last user is gone.
+        let f = fixture_plain();
+        let dfs = f.mount();
+        let m = core(&dfs);
+        drop(dfs);
+        f.cont.close(T1).unwrap();
+        assert!(listed(f.conn()).is_empty());
+        assert_eq!(Arc::strong_count(&m), 1);
+
+        // The winner of a close is stopped after it stored the end.
+        let f = fixture();
+        let dfs = f.mount();
+        let m = core(&dfs);
+        let (at_tx, at_rx) = signal();
+        let (go_tx, go_rx) = signal();
+        let winner = std::thread::spawn(move || {
+            testing::set("AfterUnmountedStore", None, move |_| {
+                at_tx.send(()).unwrap();
+                wait(&go_rx);
+            });
+            dfs.close(T1)
+        });
+        wait(&at_rx);
+        let cont = f.cont.clone();
+        std::thread::spawn(move || cont.close(T1))
+            .join()
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.calls("daos_cont_close"), 1);
+        let still = listed(f.conn());
+        assert_eq!(still.len(), 1);
+        assert!(Arc::ptr_eq(&still[0], &m));
+        drop(still);
+        go_tx.send(()).unwrap();
+        winner.join().unwrap().unwrap();
+        assert!(listed(f.conn()).is_empty());
+
+        // The mount holds the last container reference and the release
+        // finds the process unconfirmed.
+        let mem = Arc::new(MemDfs::new());
+        let dfs = Dfs::connect_mock(mem.clone()).unwrap();
+        let r = with_pid_fault_at("cont_release", || dfs.close(T1));
+        assert!(matches!(r, Err(Error::Forked { .. })), "{r:?}");
+
+        // The removal keeps the order of the others.
+        let f = fixture();
+        let mut cores = Vec::new();
+        for _ in 0..4 {
+            let d = f.mount();
+            cores.push(core(&d));
+            d.close(T1).unwrap();
+        }
+        *f.conn().mounts.lock().unwrap() = cores.clone();
+        let gen = f.conn().mounts_gen.load(Ordering::SeqCst);
+        let removed = remove_listed(f.conn(), &cores[1]).unwrap();
+        assert!(Arc::ptr_eq(&removed, &cores[1]));
+        let left = listed(f.conn());
+        let expected = [&cores[0], &cores[2], &cores[3]];
+        assert_eq!(left.len(), 3);
+        for (l, e) in left.iter().zip(expected) {
+            assert!(Arc::ptr_eq(l, e));
+        }
+        assert_eq!(f.conn().mounts_gen.load(Ordering::SeqCst), gen + 1);
+        f.conn().mounts.lock().unwrap().clear();
+    }
+
+    #[test]
+    fn standing_connection_reuses_a_live_mount_and_makes_no_new_one() {
+        let shared = |f: &Fixture, b: &Dfs| {
+            let mounts = f.calls("dfs_mount");
+            let x = f.cont.mount_dfs().unwrap();
+            let y = Dfs::connect_mock(f.mem.clone()).unwrap();
+            assert!(Arc::ptr_eq(&x.mount, &b.mount));
+            assert!(Arc::ptr_eq(&y.mount, &b.mount));
+            assert_eq!(f.calls("dfs_mount"), mounts);
+        };
+        let refused = |f: &Fixture, check: &dyn Fn(&Result<Dfs>)| {
+            let mounts = f.calls("dfs_mount");
+            check(&f.cont.mount_dfs());
+            check(&Dfs::connect_mock(f.mem.clone()));
+            assert_eq!(f.calls("dfs_mount"), mounts);
+        };
+        let eio = |r: &Result<Dfs>| assert_eq!(umount_errno(r), libc::EIO);
+        let tx_fault = |r: &Result<Dfs>| match r {
+            Err(Error::Daos {
+                op: "daos_tx_close",
+                ..
+            }) => {}
+            other => panic!("{other:?}"),
+        };
+        let fail_tx = |f: &Fixture| {
+            let tx = f.cont.tx(TxMode::ReadWrite).unwrap();
+            f.mem.fail_next("daos_tx_close", -1012);
+            assert!(tx.close().is_err());
+        };
+
+        // A failed mount and a live one.
+        let f = fixture();
+        let parked = f.park_failing_drop(f.mount(), libc::EIO);
+        let b = f.mount();
+        parked.finish();
+        shared(&f, &b);
+        drop(b);
+        refused(&f, &eio);
+
+        // A transaction fault and a live mount.
+        let f = fixture();
+        let b = f.mount();
+        fail_tx(&f);
+        shared(&f, &b);
+        drop(b);
+        refused(&f, &tx_fault);
+
+        // A transaction fault only.
+        let f = fixture();
+        fail_tx(&f);
+        refused(&f, &tx_fault);
+
+        // A mount admitted before the error appeared retries on ENOENT.
+        let f = fixture();
+        let parked = f.park_failing_drop(f.mount(), libc::EIO);
+        let mounts = f.calls("dfs_mount");
+        let pause = f.mem.pause_failing("dfs_mount", libc::ENOENT);
+        let cont = f.cont.clone();
+        let t = std::thread::spawn(move || cont.mount_dfs());
+        assert!(pause.wait_entered(LIMIT));
+        parked.finish();
+        pause.release();
+        let made = t.join().unwrap().unwrap();
+        assert_eq!(f.calls("dfs_mount"), mounts + 2);
+        drop(made);
+
+        // A mount read as being unmounted fails, and then a transaction
+        // close fails: the unmount error came first at every instant.
+        let f = fixture();
+        let parked = RefCell::new(Some(f.park_failing_drop(f.mount(), libc::EIO)));
+        let (open_tx, open_rx) = signal();
+        let (close_tx, close_rx) = signal();
+        let (closed_tx, closed_rx) = signal();
+        let cont = f.cont.clone();
+        let worker = std::thread::spawn(move || {
+            let tx = cont.tx(TxMode::ReadWrite).unwrap();
+            open_tx.send(()).unwrap();
+            wait(&close_rx);
+            assert!(tx.close().is_err());
+            closed_tx.send(()).unwrap();
+        });
+        wait(&open_rx);
+        let mem = f.mem.clone();
+        testing::set("AfterStateRead", Some(0), move |_| {
+            parked.borrow_mut().take().unwrap().finish();
+            mem.fail_next("daos_tx_close", -1012);
+            close_tx.send(()).unwrap();
+            wait(&closed_rx);
+        });
+        let mounts = f.calls("dfs_mount");
+        let r = f.cont.mount_dfs();
+        testing::clear();
+        assert_eq!(umount_errno(&r), libc::EIO);
+        assert_eq!(f.calls("dfs_mount"), mounts);
+        worker.join().unwrap();
+        refused(&f, &eio);
+    }
+
+    #[test]
+    fn closing_connection_gets_no_mount_of_a_newer_one() {
+        let f = fixture();
+        let pause = f.mem.pause_next("daos_cont_close");
+        let a = f.cont.clone();
+        let closer = std::thread::spawn(move || a.close(T1));
+        assert!(pause.wait_entered(LIMIT));
+        // The pool lease of the closing connection is still held.
+        assert!(f.conn().pool().is_ok());
+        let options = ContainerOptions::new("mock", "mock");
+        let b = Container::open_mock(f.mem.clone(), &options).unwrap();
+        assert!(!Arc::ptr_eq(&b.conn, f.conn()));
+        let newer = b.mount_dfs().unwrap();
+        let mounts = f.calls("dfs_mount");
+        let r = f.cont.mount_dfs();
+        assert!(matches!(r, Err(Error::Closed)), "{r:?}");
+        assert_eq!(f.calls("dfs_mount"), mounts);
+        pause.release();
+        closer.join().unwrap().unwrap();
+        // The newer connection keeps its mount.
+        assert!(Arc::ptr_eq(&b.mount_dfs().unwrap().mount, &newer.mount));
+    }
+
+    #[test]
+    fn cached_directory_dropped_by_a_container_close_enters_no_gate() {
+        let f = fixture();
+        let b = f.mount();
+        b.create_dir("/d").unwrap();
+        // Caches /d; the cache holds the only reference of its handle.
+        assert!(!b.exists("/d/x").unwrap());
+        let m = core(&b);
+        // Another close holds the closed mount gate exclusively while the
+        // container close drops the cached handles.
+        let (take_tx, take_rx) = signal();
+        let (held_tx, held_rx) = signal();
+        let (free_tx, free_rx) = signal();
+        let holder = std::thread::spawn(move || {
+            wait(&take_rx);
+            let guard = m.gate().hold();
+            held_tx.send(()).unwrap();
+            free_rx.recv().unwrap();
+            drop(guard);
+        });
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let cont = f.cont.clone();
+        let closer = std::thread::spawn(move || {
+            testing::set("BeforeCachedDrop", None, move |_| {
+                take_tx.send(()).unwrap();
+                wait(&held_rx);
+            });
+            done_tx.send(cont.close(T1)).unwrap();
+        });
+        let r = done_rx.recv_timeout(LIMIT);
+        let _ = free_tx.send(());
+        holder.join().unwrap();
+        closer.join().unwrap();
+        r.expect("the cached handle waited for the mount gate")
+            .unwrap();
+        assert_eq!(f.calls("dfs_umount"), 1);
+        assert_eq!(f.calls("daos_cont_close"), 1);
+        assert_eq!(f.mem.open_objects(), 0);
+        assert!(matches!(b.metadata("/d"), Err(Error::Closed)));
+    }
+
+    /// What the thread of an explicit release saw.
+    #[derive(Debug)]
+    enum Seen {
+        /// It reached the mount gate.
+        AtGate,
+        /// The release returned, with the `dfs_release` calls made by then
+        /// and whether the teardown had finished its unmount by then.
+        Returned(Result<()>, u64, bool),
+    }
+
+    /// `Dfs::close` stops after it closed the mount gate and before its
+    /// teardown released any object, and `release` (made by `open` on the
+    /// mount) runs in a thread: the release waits at the gate and returns
+    /// only after the teardown released the object.
+    fn explicit_release_waits_for_the_teardown(
+        open: impl FnOnce(&Dfs) -> Box<dyn FnOnce() -> Result<()> + Send>,
+    ) {
+        let f = fixture();
+        let b = f.mount();
+        let release = open(&b);
+        let before = f.calls("dfs_release");
+        let (at_tx, at_rx) = signal();
+        let (go_tx, go_rx) = signal();
+        // Set once the teardown stored its end, after every object of the
+        // mount was released and the mount unmounted.
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closer = {
+            let finished = finished.clone();
+            std::thread::spawn(move || {
+                testing::set("MountGateClosed", None, move |_| {
+                    at_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                });
+                testing::set("AfterUnmountedStore", None, move |_| {
+                    finished.store(true, Ordering::SeqCst);
+                });
+                b.close(T1)
+            })
+        };
+        wait(&at_rx);
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let mem = f.mem.clone();
+        let releaser = std::thread::spawn(move || {
+            let at_gate = seen_tx.clone();
+            testing::set("BeforeSharedLock", None, move |_| {
+                at_gate.send(Seen::AtGate).unwrap();
+            });
+            let r = release();
+            let done = finished.load(Ordering::SeqCst);
+            seen_tx
+                .send(Seen::Returned(r, mem.calls("dfs_release"), done))
+                .unwrap();
+        });
+        let first = seen_rx.recv_timeout(LIMIT);
+        go_tx.send(()).unwrap();
+        let last = match first {
+            Ok(Seen::AtGate) => seen_rx.recv_timeout(LIMIT),
+            other => other,
+        };
+        releaser.join().unwrap();
+        closer.join().unwrap().unwrap();
+        match last {
+            Ok(Seen::Returned(r, releases, done)) => {
+                r.unwrap();
+                assert!(
+                    releases > before,
+                    "the release returned before the teardown released the object"
+                );
+                assert!(
+                    done,
+                    "the release returned before the teardown had finished"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(f.mem.open_objects(), 0);
+    }
+
+    #[test]
+    fn file_close_returns_after_the_teardown_of_a_closing_mount() {
+        explicit_release_waits_for_the_teardown(|b| {
+            let file = b.create("/f").unwrap();
+            Box::new(move || file.close())
+        });
+    }
+
+    #[test]
+    fn writer_finish_returns_after_the_teardown_of_a_closing_mount() {
+        explicit_release_waits_for_the_teardown(|b| {
+            let mut w = b.writer("/w").unwrap();
+            w.write_all(b"x").unwrap();
+            Box::new(move || w.finish().map(|_| ()))
+        });
+    }
+
+    #[test]
+    fn handle_types_keep_their_auto_traits() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<Dfs>();
+        send_sync::<File>();
+        send_sync::<ReadDir>();
+        send_sync::<Writer>();
     }
 }

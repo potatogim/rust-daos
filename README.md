@@ -204,11 +204,37 @@ refuses with `Error::Busy`, without a DAOS call, while this process has the
 container open under the same strings; close your handles first.
 
 `close(timeout)` on a `Pool`, `Container` or `Dfs` closes the connection for
-every view. Closing a container closes its objects and unmounts its DFS
-mounts; it returns `Error::Busy` while transactions of the container are
-open or calls of its DFS mount still run at the deadline, and then changes
-nothing. A pool closes only when none of its containers is open. Dropping
+every view. A pool closes only when none of its containers is open. Dropping
 the last view closes quietly.
+
+Closing a container unmounts its DFS mount, closes its objects, closes the
+container and then gives up its pool connection. The timeout bounds the
+waiting only; cleanup that has begun runs to its end. It returns
+`Error::Busy` when at the deadline transactions of the container are open
+(`transactions`), a DFS mount of it is still being unmounted by another
+thread, by a dropped `Dfs` or a `Dfs::close` there (`open_connections`
+counts these mounts), or calls on the container or on its DFS mount still
+run (`in_flight`). While a close waits, new calls on the container get
+`Error::Closed`. The close refuses new calls on the DFS mount from when it
+installs its hold, after its first successful process check of the mount,
+until it drops that hold on return; calls already running and releases of
+handles go on. After a `Busy`, the container and the mount each accept new
+calls again as soon as it is still open and its last waiting close (for the
+mount, a `Dfs::close` counts too) has returned. A mount whose last `Dfs` was
+already gone may have been unmounted by the call all the same. If the mounts
+cannot be examined by the deadline because other threads are mounting,
+unmounting or examining them, the `Busy` may carry only `in_flight` or no
+count.
+
+A container connection is kept open for the rest of the process when a DFS
+mount of it could not be unmounted (`dfs_umount` failed), when a mount or a
+transaction of it was dropped while the process could not be confirmed as
+its owner, or when a `daos_tx_close` failed. `close` then returns that error
+at once and before any `Busy`. A DFS mount of the connection that is still
+live keeps working and is still shared, but no new mount is made on it: a
+`mount_dfs` or `Dfs::connect` that would need one returns the same error.
+The connection and its pool connection stay open, so `Pool::close` and
+`destroy_container` for it stay `Error::Busy`.
 
 A connection is bound to the container that was opened, not to its label:
 if another process renames the container, or destroys it and creates a new
@@ -341,12 +367,13 @@ overlapping writes to the same range have no defined order.
 `Dfs::close(timeout)` refuses new operations from the moment it starts (they
 return `Error::Closed`), waits for running operations, then releases every
 open handle of the mount, including those held by `File`, `Writer` and
-`ReadDir` values elsewhere; their later use returns `Error::Closed`. If
-operations are still running after the timeout, `close` returns
-`Error::Busy`, leaves the mount connected, and the mount accepts operations
-again. If a `dfs_release` fails during close, libdfs keeps that object
-allocated; the crate reports the first such error and forgets the object,
-which then leaks.
+`ReadDir` values elsewhere; their later use returns `Error::Closed` (a
+`ReadDir` may first return names it had already read). If operations are
+still running after the timeout, `close` returns `Error::Busy`, leaves the
+mount connected, and the mount accepts operations again once it is still
+open and no other close of it waits. If a `dfs_release` fails during
+close, libdfs keeps that object allocated; the crate reports the first such
+error and forgets the object, which then leaks.
 
 ## Processes
 

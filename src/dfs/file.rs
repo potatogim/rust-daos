@@ -6,7 +6,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use super::{Mount, ObjPtr};
+use super::{MountRef, ObjPtr};
 use crate::dfs::metadata::Metadata;
 use crate::error::{Error, Result};
 use crate::path;
@@ -127,9 +127,11 @@ impl OpenOptions {
 /// `Send + Sync`: positional I/O takes `&self`, so threads can share one
 /// handle. Overlapping writes to the same range from several threads have no
 /// defined order. Dropping the handle releases it (`dfs_release`) and ignores
-/// errors; [`File::close`] reports them.
+/// errors; [`File::close`] reports them. A failed `dfs_release` leaves the
+/// object allocated in libdfs; a later close of the container may then fail
+/// with the `daos_cont_close` error and leave the container handle open.
 pub struct File {
-    mount: Arc<Mount>,
+    mount: Arc<MountRef>,
     obj: ObjPtr,
     slot: u64,
     path: String,
@@ -143,7 +145,7 @@ impl fmt::Debug for File {
 }
 
 impl File {
-    pub(crate) fn open(mount: &Arc<Mount>, path: &str, options: &OpenOptions) -> Result<File> {
+    pub(crate) fn open(mount: &Arc<MountRef>, path: &str, options: &OpenOptions) -> Result<File> {
         let p = path::normalize(path)?;
         let flags = options.flags()?;
         if p == "/" {
@@ -321,7 +323,10 @@ impl File {
 
     /// Release the handle (`dfs_release`) and report an error. After
     /// [`Dfs::close`](crate::Dfs::close) this does nothing and returns `Ok`.
-    /// A failed release is reported once; the handle is gone either way.
+    /// A failed release is reported once; the handle is gone either way, and
+    /// the object stays allocated in libdfs, so a later close of the
+    /// container may fail with the `daos_cont_close` error and leave the
+    /// container handle open.
     pub fn close(mut self) -> Result<()> {
         self.mount.stamp.check_cold()?;
         self.released = true;

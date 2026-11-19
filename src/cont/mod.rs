@@ -345,6 +345,15 @@ impl Container {
     /// Mount DFS on this container (a POSIX container) with default options.
     /// Returns the shared mount when one exists for this container and
     /// access mode.
+    ///
+    /// The live mount of the connection is returned if there is one. Else,
+    /// on a connection that is kept open for good (see
+    /// [`Container::close`]), the error that keeps it open is returned and
+    /// no mount is made. That check is made once, before `dfs_mount`; its
+    /// retries on `ENOENT` are part of the same attempt. A live mount that
+    /// another connection under the same strings made is never returned:
+    /// this connection is then closing or closed, and the call returns
+    /// [`Error::Closed`].
     pub fn mount_dfs(&self) -> Result<Dfs> {
         self.mount_dfs_with(&MountOptions::default())
     }
@@ -358,27 +367,76 @@ impl Container {
         Ok(Dfs { mount })
     }
 
-    /// Close this container connection for every view: refuse new calls,
-    /// wait up to `timeout` for running ones, close every object, key-value
-    /// and array handle opened through it, unmount DFS mounts of this
-    /// container and access mode, then `daos_cont_close` and give up the
-    /// pool lease. Later calls on any of them return [`Error::Closed`].
-    ///
-    /// [`Error::Busy`] when calls still run or transactions of this
-    /// container are open at the deadline; nothing is closed then and the
-    /// connection accepts calls again. Idempotent. Dropping every view
+    /// Close this container connection for every view. A successful close
+    /// unmounts the DFS mount of this container and access mode, closes
+    /// every object, key-value and array handle opened through it, then runs
+    /// `daos_cont_close` and gives up the pool lease. Later calls on any of
+    /// them return [`Error::Closed`]. Idempotent. Dropping every view
     /// without `close` closes quietly.
+    ///
+    /// The timeout bounds the waiting only: for running calls, for open
+    /// transactions and for unmounts that other threads run. An unmount this
+    /// call started runs to its end, also past the deadline.
+    ///
+    /// While the close waits, new calls on the container are refused with
+    /// [`Error::Closed`]. New calls on its DFS mount are refused from when
+    /// the close installs its hold, after its first successful process check
+    /// of the mount, until it drops that hold on return; calls already
+    /// running and releases of handles go on. After an error each of them
+    /// accepts calls again when it is still open and its last waiting close
+    /// has returned (for the mount, a waiting [`Dfs::close`] counts too).
+    ///
+    /// The result is the first that applies:
+    ///
+    /// - [`Error::Forked`] from the process check at entry; nothing is
+    ///   touched.
+    /// - An error that keeps the connection open for the rest of the
+    ///   process, with its pool connection, returned at once and before any
+    ///   `Busy`: the `dfs_umount` error of the oldest mount that could not
+    ///   be unmounted; else [`Error::Forked`] (`current_pid` 0) of the
+    ///   oldest mount whose last user was dropped while the process could
+    ///   not be confirmed; else the error of the first transaction that was
+    ///   not closed (the `daos_tx_close` error, or [`Error::Forked`]). When
+    ///   the error existed before this call, nothing is touched. This call
+    ///   can also make one: when its own unmount of the mount in use fails,
+    ///   that mount is closed for its users and its files are released;
+    ///   only the container stays open.
+    /// - [`Error::Forked`] from the process check of the mount in use, when
+    ///   the call was about to unmount it. That mount, its files and the
+    ///   container stay as they were.
+    /// - [`Error::Busy`] at the deadline, the same whether or not calls held
+    ///   the container: open transactions (`transactions`); else DFS mounts
+    ///   of the container that another thread is unmounting
+    ///   (`open_connections`); else calls on the container, or on its DFS
+    ///   mount (`in_flight`). The container, its objects and the mount in
+    ///   use stay open, and another close of that mount may still hold it.
+    ///   When nothing stands in the way any more at the deadline, the close
+    ///   is tried once more instead.
+    /// - After the container was closed, the first error of the cleanup:
+    ///   the `daos_cont_close` error, the error of the pool release (a
+    ///   failed process check, see below, or a `daos_pool_disconnect`
+    ///   error), an error closing an object handle, a `dfs_release` error of
+    ///   a mount this call unmounted.
+    ///
+    /// A mount that another thread closed meanwhile is not an error. A
+    /// mount whose last [`Dfs`] was already gone, and whose own drop had not
+    /// started its unmount yet, may be unmounted by this call on the way; it
+    /// stays unmounted also when the call ends with `Busy` or `Forked`, and
+    /// a `dfs_release` error of that unmount is reported only when this call
+    /// closes the container.
+    ///
+    /// When the mounts cannot be examined by the deadline (the list is held
+    /// by another thread, one that examines it included, or mounts are still
+    /// being added or removed), the result is an error of the second kind
+    /// already seen by this call, else a `Busy` with only `in_flight`, or
+    /// with no count; the order above is not promised then.
     ///
     /// On an inherited handle `close` returns [`Error::Forked`] before any
     /// DAOS call when the process check at entry fails. It also returns that
     /// error when, during cleanup, the container held the last reference of
     /// its pool connection and this process cannot be confirmed as the one
     /// that connected it: the disconnect is skipped, and the container close
-    /// already done is not undone. When several cleanup steps fail, the
-    /// error returned is the first of: the `daos_cont_close` error, the error
-    /// of the pool release (this one or a `daos_pool_disconnect` error), an
-    /// error closing an object handle, an error unmounting a DFS mount of the
-    /// container.
+    /// already done is not undone.
     pub fn close(&self, timeout: Duration) -> Result<()> {
         self.conn.close(timeout)
     }

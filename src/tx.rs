@@ -37,7 +37,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::conn::{require, ContConn};
+use crate::conn::{require, state, ContConn};
 use crate::cont::Container;
 use crate::error::{Error, Result};
 use crate::sys::api::Group;
@@ -335,6 +335,14 @@ impl<'c> Tx<'c> {
 
     /// Close the handle (`daos_tx_close`); an open, uncommitted transaction
     /// is aborted first. Dropping does the same and ignores errors.
+    ///
+    /// When `daos_tx_close` fails, or the close is skipped because this
+    /// process cannot be confirmed as the one that opened the transaction,
+    /// the native transaction may stay open: the container connection is
+    /// then kept open for the rest of the process, together with its pool
+    /// connection, and [`Container::close`] returns that error. An error
+    /// from the abort alone does not keep it. The connection is kept once;
+    /// this does not limit how many transactions can be left open.
     pub fn close(self) -> Result<()> {
         // Drop runs afterwards and finds the handle closed.
         self.finish()
@@ -357,6 +365,23 @@ impl<'c> Tx<'c> {
             backend.daos_tx_close(th, std::ptr::null_mut())
         });
         self.closed.set(true);
+        // Only the result of the close decides whether the native
+        // transaction may still be open. Recorded before the count is
+        // lowered: a container close that reads the count and then the
+        // fault sees the fault of every transaction that has ended.
+        match &closed {
+            Err(Error::Daos { code, .. }) => ContConn::keep_tx(
+                &self.cont,
+                state::pack(state::TX_FAILED, code.value() as u32),
+            ),
+            Err(Error::Forked {
+                created_pid,
+                current_pid: 0,
+            }) => ContConn::keep_tx(&self.cont, state::pack(state::TX_ORPHANED, *created_pid)),
+            // Closed, refused in another process, or the container is
+            // closed.
+            _ => {}
+        }
         self.cont.transactions.fetch_sub(1, Ordering::SeqCst);
         aborted.and(closed)
     }
@@ -398,7 +423,21 @@ impl<'c> Tx<'c> {
 
 impl Drop for Tx<'_> {
     fn drop(&mut self) {
-        if self.cont.stamp.is_foreign() {
+        if self.closed.get() {
+            return; // dealt with; no process check
+        }
+        if let Err(Error::Forked {
+            created_pid,
+            current_pid,
+        }) = self.cont.stamp.check_cold()
+        {
+            if current_pid == 0 {
+                // The owner cannot be confirmed: no native call. Atomic
+                // operations only.
+                ContConn::keep_tx(&self.cont, state::pack(state::TX_ORPHANED, created_pid));
+                self.cont.transactions.fetch_sub(1, Ordering::SeqCst);
+                self.closed.set(true);
+            }
             return; // fork child: leak
         }
         let _ = self.finish();
@@ -490,5 +529,164 @@ impl Container {
             restarts += 1;
             tx.restart()?;
         }
+    }
+}
+
+#[cfg(all(test, feature = "mock"))]
+mod tests {
+    use super::*;
+    use crate::conn::support::*;
+    use crate::conn::{life, state};
+    use crate::fork::testing::{count_raw_pid_reads, rerun_alone, with_raw_pid};
+    use crate::pool::PoolOptions;
+    use crate::Pool;
+    use std::time::Duration;
+
+    /// The Rust count of open transactions and the fault of `f`.
+    fn counts(f: &Fixture) -> (usize, u64) {
+        (
+            f.conn().transactions.load(Ordering::SeqCst),
+            f.conn().tx_fault.load(Ordering::SeqCst),
+        )
+    }
+
+    /// A transaction on a new connection ended by `end`, with the count and
+    /// the fault it leaves.
+    fn end_with(end: impl FnOnce(Tx<'_>)) -> (Fixture, usize, u64) {
+        let f = fixture();
+        let tx = f.cont.tx(TxMode::ReadWrite).unwrap();
+        assert_eq!(counts(&f), (1, 0));
+        end(tx);
+        let (n, fault) = counts(&f);
+        (f, n, fault)
+    }
+
+    #[test]
+    fn transaction_end_is_counted_once() {
+        if rerun_alone("tx::tests::transaction_end_is_counted_once") {
+            return;
+        }
+        crate::fork::testing::force_plain();
+
+        let (f, n, fault) = end_with(|tx| tx.close().unwrap());
+        assert_eq!((n, fault), (0, 0));
+        assert_eq!(f.calls("daos_tx_close"), 1);
+
+        let (f, n, fault) = end_with(|tx| {
+            assert!(matches!(
+                with_raw_pid(-1, || tx.close()),
+                Err(Error::Forked { .. })
+            ));
+        });
+        assert_eq!(n, 0);
+        assert_eq!(f.calls("daos_tx_close"), 0);
+        assert_eq!(state::tag(fault), state::TX_ORPHANED);
+        assert_eq!(f.mem.open_transactions(), 1);
+
+        let f = fixture();
+        let tx = f.cont.tx(TxMode::ReadWrite).unwrap();
+        f.mem.fail_next("daos_tx_close", -1012);
+        let r = tx.close();
+        assert_eq!(r.unwrap_err().der().map(|c| c.value()), Some(1012));
+        let (n, fault) = counts(&f);
+        assert_eq!(n, 0);
+        assert_eq!(fault, state::pack(state::TX_FAILED, 1012));
+        assert_eq!(f.calls("daos_tx_close"), 1);
+
+        let (f, n, fault) = end_with(|tx| with_raw_pid(-1, || drop(tx)));
+        assert_eq!(n, 0);
+        assert_eq!(state::tag(fault), state::TX_ORPHANED);
+        assert_eq!(f.calls("daos_tx_close"), 0);
+
+        let (f, n, fault) = end_with(|tx| {
+            tx.finish().unwrap();
+            assert_eq!(count_raw_pid_reads(|| with_raw_pid(-1, || drop(tx))), 0);
+        });
+        assert_eq!((n, fault), (0, 0));
+        assert_eq!(f.calls("daos_tx_close"), 1);
+
+        let f = fixture();
+        let tx = f.cont.tx(TxMode::ReadWrite).unwrap();
+        f.mem.fail_next("daos_tx_abort", -1012);
+        let r = tx.close();
+        assert!(
+            matches!(
+                r,
+                Err(Error::Daos {
+                    op: "daos_tx_abort",
+                    ..
+                })
+            ),
+            "{r:?}"
+        );
+        assert_eq!(counts(&f), (0, 0));
+        assert_eq!(f.calls("daos_tx_close"), 1);
+    }
+
+    #[test]
+    fn transaction_not_closed_keeps_container_and_pool_open() {
+        if rerun_alone("tx::tests::transaction_not_closed_keeps_container_and_pool_open") {
+            return;
+        }
+        crate::fork::testing::force_plain();
+        type End = fn(Tx<'_>);
+        let ends: [End; 3] = [
+            |tx| {
+                let _ = with_raw_pid(-1, || tx.close());
+            },
+            |tx| {
+                let _ = tx.close();
+            },
+            |tx| with_raw_pid(-1, || drop(tx)),
+        ];
+        for (i, end) in ends.into_iter().enumerate() {
+            let mem = Arc::new(crate::mock::MemDfs::new());
+            let pool = Pool::connect_mock(mem.clone(), &PoolOptions::new("p")).unwrap();
+            let cont = pool.open_container("c").unwrap();
+            let tx = cont.tx(TxMode::ReadWrite).unwrap();
+            if i == 1 {
+                mem.fail_next("daos_tx_close", -1012);
+            }
+            end(tx);
+            let waits = cont.conn.gate.waits.load(Ordering::SeqCst);
+            let r = cont.close(Duration::from_secs(30));
+            match i {
+                1 => assert_eq!(r.unwrap_err().der().map(|c| c.value()), Some(1012)),
+                _ => assert!(
+                    matches!(r, Err(Error::Forked { current_pid: 0, .. })),
+                    "{r:?}"
+                ),
+            }
+            assert_eq!(cont.conn.gate.waits.load(Ordering::SeqCst), waits);
+            let life = Arc::clone(&cont.conn.life);
+            drop(pool);
+            drop(cont);
+            assert_eq!(mem.calls("daos_cont_close"), 0);
+            assert_eq!(mem.calls("daos_pool_disconnect"), 0);
+            assert_eq!(life.load(Ordering::SeqCst), life::OPEN);
+            let pool = Pool::connect_mock(mem.clone(), &PoolOptions::new("p")).unwrap();
+            assert!(matches!(
+                pool.destroy_container("c", true),
+                Err(Error::Busy { .. })
+            ));
+            assert_eq!(busy(&pool.close(ZERO)), (0, 0, 1));
+        }
+
+        // Two transactions left open on one connection: one reference is
+        // kept, and the first fault stays.
+        let f = fixture();
+        let before = Arc::strong_count(f.conn());
+        let first = f.cont.tx(TxMode::ReadWrite).unwrap();
+        let second = f.cont.tx(TxMode::ReadWrite).unwrap();
+        f.mem.fail_next("daos_tx_close", -1012);
+        assert!(first.close().is_err());
+        with_raw_pid(-1, || drop(second));
+        assert_eq!(Arc::strong_count(f.conn()), before + 1);
+        assert_eq!(
+            f.conn().tx_fault.load(Ordering::SeqCst),
+            state::pack(state::TX_FAILED, 1012)
+        );
+        let r = f.cont.close(Duration::from_secs(30));
+        assert_eq!(r.unwrap_err().der().map(|c| c.value()), Some(1012));
     }
 }

@@ -452,11 +452,14 @@ impl Pool {
     ///
     /// The same `Busy` holds while the last close of such a handle runs, and
     /// for the rest of the process when that close failed or was skipped
-    /// (a close whose process check failed): the crate cannot show that the
-    /// handle is closed and never closes it later. The block is by pool and
-    /// container string, so a container that another process destroys and
-    /// creates again under the same label stays blocked in this process as
-    /// well.
+    /// (a close whose process check failed), or when the connection is kept
+    /// open for good (a DFS mount of it that could not be unmounted, a mount
+    /// or transaction of it dropped while the process could not be confirmed
+    /// as its owner, a failed `daos_tx_close`; see
+    /// [`Container::close`]): the crate cannot show that the handle is
+    /// closed and never closes it later. The block is by pool and container
+    /// string, so a container that another process destroys and creates
+    /// again under the same label stays blocked in this process as well.
     pub fn destroy_container(&self, cont: &str, force: bool) -> Result<()> {
         // Before any lock: a fork child must not wait for a lock a parent
         // thread held at the fork.
@@ -499,7 +502,9 @@ impl Pool {
     ///
     /// [`Error::Busy`] (with the open container count as `open_connections`) when
     /// containers or DFS mounts of the pool are still open at the deadline;
-    /// nothing is closed then. Idempotent. Dropping every view without
+    /// nothing is closed then. A container connection kept open for good
+    /// (see [`Container::close`]) is counted as well, so the pool stays busy
+    /// for the rest of the process. Idempotent. Dropping every view without
     /// `close` disconnects quietly.
     ///
     /// On an inherited handle `close` returns [`Error::Forked`] before any

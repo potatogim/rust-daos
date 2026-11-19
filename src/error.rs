@@ -240,24 +240,46 @@ pub enum Error {
         /// Current process; 0 when its process id is not known.
         current_pid: u32,
     },
-    /// The mount, pool or container connection was closed.
+    /// The connection or mount was closed, or a close of it is waiting:
+    /// while a `close` waits for running calls, new calls are refused with
+    /// this error; when that close ends with [`Error::Busy`], calls are
+    /// accepted again once the connection or mount is still open and its
+    /// last waiting close has returned.
     Closed,
     /// `close(timeout)` timed out: operations still ran, transactions were
-    /// still open, or (for a pool) containers of the pool were still open.
-    /// Also returned by a container destroy while this process has the
-    /// container open. Nothing was closed or destroyed.
+    /// still open, DFS mounts of a container were still being unmounted,
+    /// another close of the same mount still held it, or (for a pool)
+    /// containers of the pool were still open. Also returned by a container
+    /// destroy while this process has the container open.
+    ///
+    /// The call that returns it destroyed nothing and did not close the
+    /// connection or mount it was made on. A
+    /// [`Container::close`](crate::Container::close) may still have
+    /// unmounted DFS mounts of the container whose last user was gone.
+    /// Another close may have closed that connection or mount all the same:
+    /// a [`Dfs::close`](crate::Dfs::close) that finds another close of the
+    /// mount holding it at the deadline gets `Busy` also when that close has
+    /// already closed the mount and is unmounting it. While the connection
+    /// or mount is still open, its calls are accepted again once no close of
+    /// it waits (see [`Error::Closed`]).
     #[non_exhaustive]
     Busy {
-        /// Operations that held the handle when the timeout expired. For a
-        /// container close whose DFS mount was still in use, the DFS calls
-        /// of that mount.
+        /// Operations that held the handle when the timeout expired. For
+        /// [`Container::close`](crate::Container::close): calls on the
+        /// container, or on its DFS mount, a directory handle being released
+        /// counted among them. For [`Dfs::close`](crate::Dfs::close): the
+        /// calls of the mount; 0 when another close of the same mount held
+        /// it.
         in_flight: usize,
         /// Transactions of the container still open.
         transactions: usize,
-        /// Connections that keep the request from proceeding: the container
-        /// connections of the pool for [`Pool::close`](crate::Pool::close),
-        /// 1 for a container destroy while this process has the container
-        /// open (or is opening it), 0 otherwise.
+        /// Connections that keep the request from proceeding: for
+        /// [`Container::close`](crate::Container::close), the DFS mounts of
+        /// the container that another thread is unmounting; for
+        /// [`Pool::close`](crate::Pool::close), the container connections of
+        /// the pool, also one kept open for good; 1 for a container destroy
+        /// while this process has the container open (or is opening it); 0
+        /// otherwise.
         open_connections: usize,
     },
     /// [`init`](crate::init) was not called (or did not succeed) before connecting.
@@ -567,7 +589,7 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "busy: {in_flight} operations in flight, {transactions} open transactions, \
-                 {open_connections} open connections; nothing was closed or destroyed"
+                 {open_connections} open connections"
             ),
             Error::NotInitialized => write!(
                 f,

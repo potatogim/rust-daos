@@ -99,6 +99,12 @@ struct Fault {
 struct PauseState {
     entered: bool,
     released: bool,
+    /// The result of the paused call once released (`None`: as usual).
+    #[cfg(all(test, feature = "mock"))]
+    fail: Option<c_int>,
+    /// The thread that entered the paused call.
+    #[cfg(all(test, feature = "mock"))]
+    thread: Option<std::thread::ThreadId>,
 }
 
 type PauseCell = Arc<(Mutex<PauseState>, Condvar)>;
@@ -123,6 +129,12 @@ impl PauseHandle {
             g = cv.wait_timeout(g, deadline - now).unwrap().0;
         }
         true
+    }
+
+    /// The thread that entered the paused call.
+    #[cfg(all(test, feature = "mock"))]
+    pub(crate) fn thread(&self) -> Option<std::thread::ThreadId> {
+        self.state.0.lock().unwrap().thread
     }
 
     /// Let the paused call continue.
@@ -164,6 +176,12 @@ pub struct MemDfs {
     daos: daos::Daos,
     iterate_stall: AtomicBool,
     iterate_null_name: AtomicBool,
+    /// Every call, counted before any lock of the backend is taken.
+    #[cfg(all(test, feature = "mock"))]
+    total: std::sync::atomic::AtomicU64,
+    /// Pauses queued per call after the one of `pause_next`.
+    #[cfg(all(test, feature = "mock"))]
+    queued: Mutex<HashMap<String, std::collections::VecDeque<PauseCell>>>,
 }
 
 impl fmt::Debug for MemDfs {
@@ -248,6 +266,10 @@ impl MemDfs {
             daos: daos::Daos::default(),
             iterate_stall: AtomicBool::new(false),
             iterate_null_name: AtomicBool::new(false),
+            #[cfg(all(test, feature = "mock"))]
+            total: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(all(test, feature = "mock"))]
+            queued: Mutex::new(HashMap::new()),
         }
     }
 
@@ -314,6 +336,42 @@ impl MemDfs {
             .unwrap()
             .insert(op.to_string(), state.clone());
         PauseHandle { state }
+    }
+
+    /// Block a later call of `op`: pauses queue up, one per call, after
+    /// the one of [`MemDfs::pause_next`].
+    #[cfg(all(test, feature = "mock"))]
+    pub(crate) fn pause_also(&self, op: &str) -> PauseHandle {
+        self.queue_pause(op, None)
+    }
+
+    /// Block the next call of `op` and make that same call return `rc`
+    /// once released.
+    #[cfg(all(test, feature = "mock"))]
+    pub(crate) fn pause_failing(&self, op: &str, rc: i32) -> PauseHandle {
+        self.queue_pause(op, Some(rc))
+    }
+
+    #[cfg(all(test, feature = "mock"))]
+    fn queue_pause(&self, op: &str, fail: Option<c_int>) -> PauseHandle {
+        let st = PauseState {
+            fail,
+            ..PauseState::default()
+        };
+        let state: PauseCell = Arc::new((Mutex::new(st), Condvar::new()));
+        self.queued
+            .lock()
+            .unwrap()
+            .entry(op.to_string())
+            .or_default()
+            .push_back(state.clone());
+        PauseHandle { state }
+    }
+
+    /// Every call so far, counted before the backend takes a lock.
+    #[cfg(all(test, feature = "mock"))]
+    pub(crate) fn calls_total(&self) -> u64 {
+        self.total.load(Ordering::SeqCst)
     }
 
     /// Hold the lock of this backend's connection registry until the
@@ -403,6 +461,8 @@ impl MemDfs {
 
     /// Count the call, honour a pause, and return an injected result.
     fn enter(&self, op: &str) -> Option<c_int> {
+        #[cfg(all(test, feature = "mock"))]
+        self.total.fetch_add(1, Ordering::SeqCst);
         *self
             .calls
             .lock()
@@ -410,13 +470,29 @@ impl MemDfs {
             .entry(op.to_string())
             .or_insert(0) += 1;
         let pause = self.pauses.lock().unwrap().remove(op);
+        #[cfg(all(test, feature = "mock"))]
+        let pause = pause.or_else(|| {
+            self.queued
+                .lock()
+                .unwrap()
+                .get_mut(op)
+                .and_then(|q| q.pop_front())
+        });
         if let Some(p) = pause {
             let (m, cv) = &*p;
             let mut g = m.lock().unwrap();
             g.entered = true;
+            #[cfg(all(test, feature = "mock"))]
+            {
+                g.thread = Some(std::thread::current().id());
+            }
             cv.notify_all();
             while !g.released {
                 g = cv.wait(g).unwrap();
+            }
+            #[cfg(all(test, feature = "mock"))]
+            if let Some(rc) = g.fail {
+                return Some(rc);
             }
         }
         let mut faults = self.faults.lock().unwrap();

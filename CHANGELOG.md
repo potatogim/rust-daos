@@ -8,6 +8,46 @@ Versions before 1.0 may change the API in minor releases. MSRV bumps are a
 minor-version change and are listed here.
 
 ## [Unreleased]
+### Fixed
+- `Container::close` never reaches `daos_cont_close` while a DFS mount of
+  the container is still being unmounted, by a dropped `Dfs` or by a
+  `Dfs::close` in another thread, or while a directory handle of the mount
+  is still being released. It waits for the unmount and returns
+  `Error::Busy` when it has not finished by the deadline, with
+  `open_connections` giving the number of such mounts; when transactions
+  of the container are open as well, the `Busy` reports those instead and
+  `open_connections` is 0. In 0.1.0 a container close that overlapped the
+  drop of the last `Dfs` could run `daos_cont_close` under the mount and
+  leave the container unusable and not closed.
+- A container connection with a DFS mount that could not be unmounted,
+  with a mount or transaction dropped while the process could not be
+  confirmed as its owner, or with a failed `daos_tx_close`, stays open for
+  the rest of the process, together with its pool connection: `close`
+  returns that error at once and before any `Busy`, no `daos_cont_close` or
+  `daos_pool_disconnect` is attempted when its handles are dropped, a call
+  that would make a new DFS mount on it returns the same error (a mount of
+  it that is still live stays shared, and a mount whose `dfs_mount` was
+  already admitted when the error appeared may complete, its retries on
+  `ENOENT` included), and `Pool::close` and `destroy_container` for it stay
+  `Error::Busy`.
+- `Container::mount_dfs` on a connection that is being closed returns
+  `Error::Closed` instead of a live mount that a newer connection to the
+  same container made.
+- The reason in a `Busy` from `Container::close` no longer depends on
+  whether calls were running on the container at the deadline, and a reason
+  that has gone by the deadline is not reported: the close is tried once
+  more.
+- A transaction that was closed is no longer looked at again when it is
+  dropped.
+- A `Busy` from `Container::close` whose mounts could not be examined by
+  the deadline carries only `in_flight`, or no count.
+- `Container::close` no longer holds the container while it waits for
+  calls of its DFS mount. New calls of the container get `Error::Closed`
+  while the close waits; new calls of the mount get it from when the close
+  installs its hold, after its first successful process check of the
+  mount, until it drops that hold on return (in 0.1.0 only while it waited
+  on the mount itself); after a `Busy` each of them works again when it is
+  still open and its last waiting close has returned.
 
 ## [0.1.0] - 2026-11-18
 ### Added
